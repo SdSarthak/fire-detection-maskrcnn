@@ -1,0 +1,81 @@
+# Cloud Build configuration for automated CI/CD pipeline
+# This file defines the build steps for containerizing and deploying the model
+
+steps:
+  # Step 1: Build Docker image and push to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-image'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPO}/fire-detection:${SHORT_SHA}'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPO}/fire-detection:latest'
+      - '-f'
+      - 'mlops/flask_app/Dockerfile'
+      - '.'
+    waitFor: ['-']
+
+  # Step 2: Push image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-image'
+    args:
+      - 'push'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPO}/fire-detection:${SHORT_SHA}'
+    waitFor: ['build-image']
+
+  # Step 3: Download model from GCS
+  - name: 'gcr.io/cloud-builders/gcs-fetcher'
+    id: 'download-model'
+    args:
+      - '${_MODEL_GCS_PATH}'
+      - '.'
+    waitFor: ['-']
+
+  # Step 4: Publish message to Pub/Sub topic with image information
+  - name: 'gcr.io/cloud-builders/gke-deploy'
+    id: 'publish-message'
+    args:
+      - run
+      - '-f'
+      - 'mlops/cloudbuild/pubsub_publish.yaml'
+    env:
+      - 'CLOUDSDK_COMPUTE_ZONE=${_GKE_ZONE}'
+      - 'CLOUDSDK_CONTAINER_CLUSTER=${_GKE_CLUSTER}'
+    waitFor: ['push-image']
+
+  # Step 5: Update GKE deployment with new image
+  - name: 'gcr.io/cloud-builders/kubectl'
+    id: 'update-deployment'
+    args:
+      - 'set'
+      - 'image'
+      - 'deployment/fire-detection'
+      - 'fire-detection=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPO}/fire-detection:${SHORT_SHA}'
+      - '-n'
+      - 'default'
+    env:
+      - 'CLOUDSDK_COMPUTE_ZONE=${_GKE_ZONE}'
+      - 'CLOUDSDK_CONTAINER_CLUSTER=${_GKE_CLUSTER}'
+    waitFor: ['publish-message']
+
+# Build images
+images:
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPO}/fire-detection:${SHORT_SHA}'
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPO}/fire-detection:latest'
+
+# Substitution variables
+substitutions:
+  _REGION: 'us-central1'
+  _ARTIFACT_REPO: 'fire-detection'
+  _MODEL_GCS_PATH: 'gs://fire-detection-models/fire_detection_model.h5'
+  _GKE_CLUSTER: 'fire-detection-cluster'
+  _GKE_ZONE: 'us-central1-a'
+
+# Timeout
+timeout: 1800s
+
+# Build options
+options:
+  machineType: 'N1_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY

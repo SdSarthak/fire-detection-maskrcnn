@@ -1,0 +1,112 @@
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+.installed.cfg
+build/
+dist/
+sdist/
+wheels/
+develop-eggs/
+downloads/
+eggs/
+parts/
+var/
+
+# Secrets / credentials
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+credentials.json
+serviceAccount*.json
+gcp-key.json
+gcloud-service-key.json
+.gcp/
+kubeconfig
+kubeconfig.yaml
+
+# Model weights and checkpoints
+*.h5
+*.pt
+*.pth
+*.pkl
+*.ckpt
+*.pb
+*.onnx
+*.tflite
+segmentation/weights/
+
+# Datasets
+segmentation/data/train/*
+segmentation/data/val/*
+segmentation/data/test/*
+segmentation/data/annotations/*.json
+!segmentation/data/**/.gitkeep
+*.tar.gz
+*.zip
+*.rar
+*.7z
+
+# Outputs
+segmentation/outputs/*
+!segmentation/outputs/.gitkeep
+
+# Flask uploads
+mlops/flask_app/uploads/*
+!mlops/flask_app/uploads/.gitkeep
+
+# Databases
+*.sqlite3
+*.db
+
+# Node
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# Logs
+*.log
+logs/
+*.out
+
+# Cache / test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+test-results/
+
+# OS
+.DS_Store
+Thumbs.db
+.AppleDouble
+.LSOverride
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/

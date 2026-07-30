@@ -1,0 +1,6 @@
+flask>=2.0.0
+werkzeug>=2.0.0
+google-cloud-logging>=2.0.0
+google-cloud-container>=2.0.0
+google-cloud-pubsub>=2.0.0
+kubernetes>=20.0.0
