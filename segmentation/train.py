@@ -1,176 +1,199 @@
 """
-Training pipeline for Mask R-CNN Fire Detection
-Orchestrates data loading, model building, and training
+Training pipeline for Mask R-CNN fire detection.
+
+Fine-tunes a COCO-pretrained Mask R-CNN on fire images annotated with the
+VGG Image Annotator, evaluating each epoch and keeping the best checkpoint.
+
+    python train.py --epochs 30
+    python train.py --data-dir /data/fire --epochs 10 --batch-size 2
 """
-import numpy as np
-import tensorflow as tf
-from pathlib import Path
+from __future__ import annotations
+
+import argparse
+import json
 import sys
+from pathlib import Path
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent))
+import torch
+from torch.utils.data import DataLoader
 
-from src.config import FireDetectionConfig, PROJECT_ROOT, WEIGHTS_DIR, OUTPUTS_DIR
-from src.dataset import LoadDataset, LoadBackbone
-from src.model import MaskRCNNBuilder, ModelTrainer
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-
-def download_pretrained_weights():
-    """Download pre-trained weights if not available"""
-    import os
-    
-    weights_file = WEIGHTS_DIR / 'mask_rcnn_coco.h5'
-    
-    if not weights_file.exists():
-        print("Downloading pre-trained Mask R-CNN weights...")
-        print("Note: Weights should be downloaded from:")
-        print("https://github.com/matterport/Mask_RCNN/releases/download/v2.1/mask_rcnn_coco.h5")
-        print(f"And placed in: {WEIGHTS_DIR}")
+from src.config import (ANNOTATIONS_DIR, DATA_DIR, OUTPUTS_DIR, WEIGHTS_DIR,
+                        FireDetectionConfig, ensure_directories)
+from src.dataset import FireSegmentationDataset, collate_fn
+from src.model import (build_model, compute_validation_loss, create_optimizer,
+                       create_scheduler, evaluate, resolve_device,
+                       save_checkpoint, train_one_epoch)
 
 
-def create_data_generators(config):
-    """
-    Create training and validation data generators
-    
-    Args:
-        config: Configuration object
-        
-    Returns:
-        Tuple of (train_generator, val_generator)
-    """
-    # Simple data augmentation
-    train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
-        rescale=1.0/255.0,
-        rotation_range=20,
-        width_shift_range=0.2,
-        height_shift_range=0.2,
-        horizontal_flip=True,
-        zoom_range=0.2,
-        fill_mode='nearest'
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description='Train the Mask R-CNN fire detection model.')
+    parser.add_argument('--data-dir', default=str(DATA_DIR),
+                        help='Root data directory containing train/ and val/')
+    parser.add_argument('--annotations-dir', default=str(ANNOTATIONS_DIR),
+                        help='Directory holding the VIA annotation JSON files')
+    parser.add_argument('--train-annotations', default='train_annotations.json',
+                        help='VIA annotation file for the training split')
+    parser.add_argument('--val-annotations', default='val_annotations.json',
+                        help='VIA annotation file for the validation split')
+    parser.add_argument('--class-filter', default='fire',
+                        help='Comma separated region attribute values to keep '
+                             '(empty string keeps every region)')
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--batch-size', type=int, default=None)
+    parser.add_argument('--lr', type=float, default=None, dest='learning_rate')
+    parser.add_argument('--num-workers', type=int, default=None)
+    parser.add_argument('--device', default=None, choices=['auto', 'cpu', 'cuda'])
+    parser.add_argument('--pretrained', default=None,
+                        choices=['coco', 'imagenet', 'none'],
+                        help='Which pre-trained weights to start from')
+    parser.add_argument('--output', default=None,
+                        help='Checkpoint path (default: weights/fire_detection_model.pt)')
+    parser.add_argument('--history', default=str(OUTPUTS_DIR / 'training_history.json'),
+                        help='Where to write the per-epoch metrics')
+    parser.add_argument('--seed', type=int, default=None)
+    return parser.parse_args(argv)
+
+
+def build_config(args: argparse.Namespace) -> FireDetectionConfig:
+    """Layer CLI flags on top of the environment-derived configuration."""
+    return FireDetectionConfig.from_env(
+        TRAIN_EPOCHS=args.epochs,
+        BATCH_SIZE=args.batch_size,
+        LEARNING_RATE=args.learning_rate,
+        NUM_WORKERS=args.num_workers,
+        DEVICE=args.device,
+        PRETRAINED_WEIGHTS=args.pretrained,
+        MODEL_PATH=args.output,
+        SEED=args.seed,
     )
-    
-    val_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
-        rescale=1.0/255.0
+
+
+def build_dataloaders(args: argparse.Namespace, config: FireDetectionConfig):
+    """Create the train and validation loaders, tolerating a missing val split."""
+    data_dir = Path(args.data_dir)
+    annotations_dir = Path(args.annotations_dir)
+    class_filter = [c.strip() for c in args.class_filter.split(',') if c.strip()] or None
+
+    train_dataset = FireSegmentationDataset(
+        images_dir=data_dir / 'train',
+        annotations=annotations_dir / args.train_annotations,
+        class_filter=class_filter,
+        horizontal_flip_prob=config.HORIZONTAL_FLIP_PROB,
     )
-    
-    return train_datagen, val_datagen
+    if len(train_dataset) == 0:
+        raise SystemExit(
+            f'No annotated training images found.\n'
+            f'  images:      {data_dir / "train"}\n'
+            f'  annotations: {annotations_dir / args.train_annotations}\n'
+            'Annotate fire regions with the VGG Image Annotator and export the '
+            'project as JSON, then re-run.')
+
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE,
+                              shuffle=True, num_workers=config.NUM_WORKERS,
+                              collate_fn=collate_fn)
+
+    val_annotations = annotations_dir / args.val_annotations
+    val_images = data_dir / 'val'
+    val_loader = None
+    if val_images.exists() and val_annotations.exists():
+        val_dataset = FireSegmentationDataset(
+            images_dir=val_images,
+            annotations=val_annotations,
+            class_filter=class_filter,
+            horizontal_flip_prob=0.0,
+        )
+        if len(val_dataset) > 0:
+            val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False,
+                                    num_workers=config.NUM_WORKERS,
+                                    collate_fn=collate_fn)
+
+    return train_loader, val_loader
 
 
-def main():
-    """Main training pipeline"""
-    
-    print("=" * 60)
-    print("Mask R-CNN Fire Detection - Training Pipeline")
-    print("=" * 60)
-    
-    # Configuration
-    config = FireDetectionConfig()
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    config = build_config(args)
+
+    ensure_directories()
+    torch.manual_seed(config.SEED)
+
+    print('=' * 60)
+    print('Mask R-CNN fire detection - training')
+    print('=' * 60)
     config.display()
-    
-    print("\n" + "=" * 60)
-    print("Step 1: Download Pre-trained Weights")
-    print("=" * 60)
-    download_pretrained_weights()
-    
-    print("\n" + "=" * 60)
-    print("Step 2: Load Dataset")
-    print("=" * 60)
-    
-    dataset_loader = LoadDataset(
-        data_dir=PROJECT_ROOT / 'data',
-        annotations_dir=PROJECT_ROOT / 'data' / 'annotations'
-    )
-    
-    print("Loading training dataset...")
-    train_dataset = dataset_loader.load_images_from_dir(
-        'train',
-        annotation_file='train_annotations.json'
-    )
-    print(f"  ✓ Training samples: {len(train_dataset)}")
-    
-    print("Loading validation dataset...")
-    val_dataset = dataset_loader.load_images_from_dir(
-        'val',
-        annotation_file='val_annotations.json'
-    )
-    print(f"  ✓ Validation samples: {len(val_dataset)}")
-    
-    print("\n" + "=" * 60)
-    print("Step 3: Load Backbone Weights")
-    print("=" * 60)
-    
-    backbone_loader = LoadBackbone(weights_path=str(WEIGHTS_DIR / 'mask_rcnn_coco.h5'))
-    print("Backbone loader initialized")
-    
-    print("\n" + "=" * 60)
-    print("Step 4: Build Model")
-    print("=" * 60)
-    
-    builder = MaskRCNNBuilder(config)
-    model = builder.build_complete_model()
-    print("  ✓ Model architecture created")
-    
-    # Compile model
-    model = builder.compile_model(model)
-    print("  ✓ Model compiled")
-    
-    # Print model summary
-    print("\nModel Summary:")
-    model.summary()
-    
-    print("\n" + "=" * 60)
-    print("Step 5: Create Data Generators")
-    print("=" * 60)
-    
-    train_gen, val_gen = create_data_generators(config)
-    print("  ✓ Data generators created")
-    
-    print("\n" + "=" * 60)
-    print("Step 6: Train Model")
-    print("=" * 60)
-    
-    trainer = ModelTrainer(model, config)
-    
-    print("Starting training...")
-    print(f"  Epochs: {config.TRAIN_EPOCHS}")
-    print(f"  Steps per epoch: {config.STEPS_PER_EPOCH}")
-    
-    # For demonstration, we'll create dummy data
-    # In production, this would use actual data generators
-    print("\n  NOTE: Using dummy data for demonstration")
-    print("  To train with real data:")
-    print("  1. Place training images in data/train/")
-    print("  2. Place validation images in data/val/")
-    print("  3. Create annotation JSON files using VGG Annotator")
-    
-    # Create dummy training data
-    dummy_images = np.random.rand(5, 256, 256, 3)
-    dummy_classes = np.random.randint(0, config.NUM_CLASSES, (5, config.NUM_CLASSES))
-    dummy_bboxes = np.random.rand(5, config.NUM_CLASSES * 4)
-    dummy_masks = np.random.rand(5, 112, 112, config.NUM_CLASSES)
-    
-    print("\nTraining model on dummy data (for demonstration)...")
-    history = trainer.train(
-        train_generator=(dummy_images, (dummy_classes, dummy_bboxes, dummy_masks)),
-        val_generator=None,
-        epochs=2  # Use 2 epochs for demonstration
-    )
-    
-    print("\n" + "=" * 60)
-    print("Step 7: Save Model")
-    print("=" * 60)
-    
-    trainer.save_model(config.MODEL_PATH)
-    print(f"  ✓ Model saved to {config.MODEL_PATH}")
-    
-    print("\n" + "=" * 60)
-    print("Training Complete!")
-    print("=" * 60)
-    print(f"\nModel Location: {config.MODEL_PATH}")
-    print(f"Outputs Directory: {OUTPUTS_DIR}")
-    
-    return model
+
+    device = resolve_device(config.DEVICE)
+    print(f'\nDevice: {device}')
+
+    train_loader, val_loader = build_dataloaders(args, config)
+    print(f'Training images:   {len(train_loader.dataset)}')
+    print(f'Validation images: {len(val_loader.dataset) if val_loader else 0}')
+    if val_loader is None:
+        print('  (no validation split found - the last epoch will be kept)')
+
+    skipped = train_loader.dataset.unannotated
+    if skipped:
+        print(f'  skipped {len(skipped)} unannotated image(s): '
+              f'{", ".join(skipped[:5])}{" ..." if len(skipped) > 5 else ""}')
+
+    print('\nBuilding model...')
+    model = build_model(config)
+    model.to(device)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'  trainable parameters: {trainable:,}')
+
+    optimizer = create_optimizer(model, config)
+    scheduler = create_scheduler(optimizer, config)
+
+    checkpoint_path = Path(config.MODEL_PATH)
+    best_score = -1.0
+    history = []
+
+    print(f'\nTraining for {config.TRAIN_EPOCHS} epoch(s)...')
+    for epoch in range(config.TRAIN_EPOCHS):
+        losses = train_one_epoch(model, optimizer, train_loader, device, epoch, config)
+        scheduler.step()
+
+        record = {'epoch': epoch, **{k: round(v, 5) for k, v in losses.items()}}
+
+        if val_loader is not None:
+            record['val_loss'] = round(compute_validation_loss(model, val_loader, device), 5)
+            metrics = evaluate(model, val_loader, device, config)
+            record.update({f'val_{k}': round(v, 5) for k, v in metrics.items()})
+            score = metrics['f1']
+        else:
+            score = -losses['loss']  # no validation data: track training loss
+
+        history.append(record)
+        summary = ' '.join(f'{k}={v}' for k, v in record.items()
+                           if k in {'loss', 'val_loss', 'val_f1', 'val_mean_iou'})
+        print(f'  epoch {epoch} done in {losses["seconds"]:.1f}s | {summary}')
+
+        if score > best_score:
+            best_score = score
+            save_checkpoint(model, checkpoint_path, config, epoch=epoch,
+                            metrics={k: v for k, v in record.items()
+                                     if isinstance(v, (int, float))})
+            print(f'  new best checkpoint -> {checkpoint_path}')
+
+    if best_score < 0 and not checkpoint_path.exists():
+        save_checkpoint(model, checkpoint_path, config, epoch=config.TRAIN_EPOCHS - 1)
+
+    history_path = Path(args.history)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(json.dumps(history, indent=2), encoding='utf-8')
+
+    print('\n' + '=' * 60)
+    print('Training complete')
+    print('=' * 60)
+    print(f'Checkpoint: {checkpoint_path}')
+    print(f'History:    {history_path}')
+    print(f'Weights dir: {WEIGHTS_DIR}')
+    return 0
 
 
-if __name__ == "__main__":
-    model = main()
+if __name__ == '__main__':
+    raise SystemExit(main())
