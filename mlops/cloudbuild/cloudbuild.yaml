@@ -1,81 +1,104 @@
-# Cloud Build configuration for automated CI/CD pipeline
-# This file defines the build steps for containerizing and deploying the model
+# Cloud Build CI/CD pipeline for the fire detection API.
+#
+# Trigger this on pushes to main. It builds the container, pushes it to
+# Artifact Registry and publishes a Pub/Sub message; the Cloud Run Function in
+# mlops/cloud_functions/ consumes that message and rolls the new image out.
+#
+#   gcloud builds submit --config mlops/cloudbuild/cloudbuild.yaml \
+#     --substitutions=_REGION=us-central1,_ARTIFACT_REPO=fire-detection
 
 steps:
-  # Step 1: Build Docker image and push to Artifact Registry
+  # 1. Build the image (repository root is the build context).
   - name: 'gcr.io/cloud-builders/docker'
     id: 'build-image'
     args:
       - 'build'
       - '-t'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPO}/fire-detection:${SHORT_SHA}'
+      - '${_IMAGE}:${SHORT_SHA}'
       - '-t'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPO}/fire-detection:latest'
+      - '${_IMAGE}:latest'
       - '-f'
       - 'mlops/flask_app/Dockerfile'
       - '.'
-    waitFor: ['-']
 
-  # Step 2: Push image to Artifact Registry
+  # 2. Push both tags.
   - name: 'gcr.io/cloud-builders/docker'
-    id: 'push-image'
-    args:
-      - 'push'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPO}/fire-detection:${SHORT_SHA}'
+    id: 'push-sha'
+    args: ['push', '${_IMAGE}:${SHORT_SHA}']
     waitFor: ['build-image']
 
-  # Step 3: Download model from GCS
-  - name: 'gcr.io/cloud-builders/gcs-fetcher'
-    id: 'download-model'
-    args:
-      - '${_MODEL_GCS_PATH}'
-      - '.'
-    waitFor: ['-']
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-latest'
+    args: ['push', '${_IMAGE}:latest']
+    waitFor: ['build-image']
 
-  # Step 4: Publish message to Pub/Sub topic with image information
-  - name: 'gcr.io/cloud-builders/gke-deploy'
-    id: 'publish-message'
+  # 3. Announce the new image so the Cloud Run Function can patch the cluster.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'publish-image-ready'
+    entrypoint: 'bash'
     args:
-      - run
-      - '-f'
-      - 'mlops/cloudbuild/pubsub_publish.yaml'
-    env:
-      - 'CLOUDSDK_COMPUTE_ZONE=${_GKE_ZONE}'
-      - 'CLOUDSDK_CONTAINER_CLUSTER=${_GKE_CLUSTER}'
-    waitFor: ['push-image']
+      - '-c'
+      - |
+        set -euo pipefail
+        gcloud pubsub topics publish "${_PUBSUB_TOPIC}" --message "$(cat <<EOF
+        {
+          "image_uri": "${_IMAGE}:${SHORT_SHA}",
+          "build_id": "${BUILD_ID}",
+          "commit_sha": "${COMMIT_SHA}",
+          "repo_name": "${REPO_NAME}"
+        }
+        EOF
+        )"
+    waitFor: ['push-sha']
 
-  # Step 5: Update GKE deployment with new image
+  # 4. Belt and braces: apply the image directly too, so a deploy still happens
+  #    if the Pub/Sub consumer is unavailable. `kubectl set image` is idempotent.
   - name: 'gcr.io/cloud-builders/kubectl'
     id: 'update-deployment'
     args:
       - 'set'
       - 'image'
-      - 'deployment/fire-detection'
-      - 'fire-detection=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPO}/fire-detection:${SHORT_SHA}'
+      - 'deployment/${_DEPLOYMENT}'
+      - '${_DEPLOYMENT}=${_IMAGE}:${SHORT_SHA}'
       - '-n'
-      - 'default'
+      - '${_NAMESPACE}'
     env:
       - 'CLOUDSDK_COMPUTE_ZONE=${_GKE_ZONE}'
       - 'CLOUDSDK_CONTAINER_CLUSTER=${_GKE_CLUSTER}'
-    waitFor: ['publish-message']
+    waitFor: ['publish-image-ready']
 
-# Build images
+  # 5. Block until the rollout is healthy so a failed build fails the pipeline.
+  - name: 'gcr.io/cloud-builders/kubectl'
+    id: 'verify-rollout'
+    args:
+      - 'rollout'
+      - 'status'
+      - 'deployment/${_DEPLOYMENT}'
+      - '-n'
+      - '${_NAMESPACE}'
+      - '--timeout=10m'
+    env:
+      - 'CLOUDSDK_COMPUTE_ZONE=${_GKE_ZONE}'
+      - 'CLOUDSDK_CONTAINER_CLUSTER=${_GKE_CLUSTER}'
+    waitFor: ['update-deployment']
+
 images:
-  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPO}/fire-detection:${SHORT_SHA}'
-  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPO}/fire-detection:latest'
+  - '${_IMAGE}:${SHORT_SHA}'
+  - '${_IMAGE}:latest'
 
-# Substitution variables
 substitutions:
   _REGION: 'us-central1'
   _ARTIFACT_REPO: 'fire-detection'
-  _MODEL_GCS_PATH: 'gs://fire-detection-models/fire_detection_model.h5'
+  _IMAGE: '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPO}/fire-detection'
   _GKE_CLUSTER: 'fire-detection-cluster'
   _GKE_ZONE: 'us-central1-a'
+  _DEPLOYMENT: 'fire-detection'
+  _NAMESPACE: 'default'
+  _PUBSUB_TOPIC: 'fire-detection-image-ready'
 
-# Timeout
-timeout: 1800s
+timeout: 2400s
 
-# Build options
 options:
-  machineType: 'N1_HIGHCPU_8'
+  machineType: 'E2_HIGHCPU_8'
   logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true

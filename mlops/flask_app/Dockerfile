@@ -1,68 +1,54 @@
-# Multi-stage Dockerfile for Mask R-CNN Fire Detection API
+# Container image for the Mask R-CNN fire detection API.
+# Build from the repository root so the segmentation package can be copied in:
+#   docker build -t fire-detection -f mlops/flask_app/Dockerfile .
 
-# Stage 1: Builder
-FROM python:3.9-slim as builder
+# ---------------------------------------------------------------- build stage
+FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libopencv-dev \
-    python3-opencv \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
-COPY requirements.txt .
+COPY mlops/flask_app/requirements.txt .
 
-# Install Python dependencies
-RUN pip install --user --no-cache-dir -r requirements.txt
+# CPU-only torch wheels keep the image roughly 2 GB smaller than the CUDA build.
+RUN pip install --user --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        -r requirements.txt
 
-# Stage 2: Runtime
-FROM python:3.9-slim
+# -------------------------------------------------------------- runtime stage
+FROM python:3.11-slim
 
-# Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    MODEL_PATH=/models/fire_detection_model.h5 \
-    FLASK_APP=app.py
+    MODEL_PATH=/models/fire_detection_model.pt \
+    SEGMENTATION_ROOT=/app/segmentation \
+    SCORE_THRESHOLD=0.5 \
+    DEVICE=cpu \
+    PATH=/home/appuser/.local/bin:$PATH
 
-# Create app user
-RUN useradd -m -u 1000 appuser
+# opencv-python-headless still needs libglib for its imgproc bindings.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libglib2.0-0 \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 1000 appuser \
+    && mkdir -p /models \
+    && chown -R appuser:appuser /models
 
 WORKDIR /app
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    libopencv-core4.2 \
-    libopencv-imgproc4.2 \
-    libopencv-highgui4.2 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder --chown=appuser:appuser /root/.local /home/appuser/.local
+COPY --chown=appuser:appuser mlops/flask_app/ /app/
+COPY --chown=appuser:appuser segmentation/src/ /app/segmentation/src/
 
-# Copy Python dependencies from builder
-COPY --from=builder /root/.local /home/appuser/.local
-
-# Copy application files
-COPY --chown=appuser:appuser flask_app/ .
-
-# Set PATH
-ENV PATH=/home/appuser/.local/bin:$PATH
-
-# Create models directory
-RUN mkdir -p /models && chown -R appuser:appuser /models
-
-# Switch to app user
 USER appuser
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:5000/health')" || exit 1
-
-# Expose port
 EXPOSE 5000
 
-# Run application
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+    CMD curl -fsS http://localhost:5000/health || exit 1
+
 CMD ["uwsgi", "--ini", "uwsgi.ini"]

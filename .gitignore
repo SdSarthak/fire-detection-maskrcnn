@@ -64,10 +64,6 @@ segmentation/data/annotations/*.json
 segmentation/outputs/*
 !segmentation/outputs/.gitkeep
 
-# Flask uploads
-mlops/flask_app/uploads/*
-!mlops/flask_app/uploads/.gitkeep
-
 # Databases
 *.sqlite3
 *.db

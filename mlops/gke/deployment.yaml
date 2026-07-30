@@ -1,3 +1,6 @@
+# GKE resources for the fire detection API.
+# Replace PROJECT_ID before applying, or render with:
+#   sed "s/PROJECT_ID/$(gcloud config get-value project)/" mlops/gke/deployment.yaml | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -5,7 +8,6 @@ metadata:
   namespace: default
   labels:
     app: fire-detection
-    version: v1
 spec:
   replicas: 3
   strategy:
@@ -20,7 +22,7 @@ spec:
     metadata:
       labels:
         app: fire-detection
-        version: v1
+        app.kubernetes.io/version: "1.0.0"
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "5000"
@@ -31,88 +33,129 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         fsGroup: 1000
-      
+
+      # Pull the trained checkpoint from Cloud Storage before the API starts.
+      # The service account needs Workload Identity with objectViewer on the
+      # bucket; see mlops/DEPLOYMENT_GUIDE.md.
+      initContainers:
+        - name: fetch-model
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          command: ['sh', '-c']
+          args:
+            - |
+              set -eu
+              echo "Fetching $MODEL_GCS_URI"
+              gcloud storage cp "$MODEL_GCS_URI" /models/fire_detection_model.pt
+              ls -lh /models/fire_detection_model.pt
+          env:
+            - name: MODEL_GCS_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: fire-detection-config
+                  key: model_gcs_uri
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+
       containers:
-      - name: fire-detection
-        image: us-central1-docker.pkg.dev/PROJECT_ID/fire-detection/fire-detection:latest
-        imagePullPolicy: Always
-        
-        ports:
-        - name: http
-          containerPort: 5000
-          protocol: TCP
-        
-        env:
-        - name: MODEL_PATH
-          value: "/models/fire_detection_model.h5"
-        - name: PYTHONUNBUFFERED
-          value: "1"
-        - name: FLASK_ENV
-          value: "production"
-        
-        # Volume mounts
-        volumeMounts:
-        - name: model-storage
-          mountPath: /models
-          readOnly: true
-        - name: tmp
-          mountPath: /tmp
-        
-        # Readiness probe
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: http
-          initialDelaySeconds: 30
-          periodSeconds: 10
-          timeoutSeconds: 5
-          failureThreshold: 3
-        
-        # Liveness probe
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: http
-          initialDelaySeconds: 60
-          periodSeconds: 30
-          timeoutSeconds: 10
-          failureThreshold: 3
-        
-        # Resource requests and limits
-        resources:
-          requests:
-            memory: "2Gi"
-            cpu: "1"
-          limits:
-            memory: "4Gi"
-            cpu: "2"
-        
-        # Security context
-        securityContext:
-          allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
-          capabilities:
-            drop:
-            - ALL
-      
-      # Volumes
+        - name: fire-detection
+          image: us-central1-docker.pkg.dev/PROJECT_ID/fire-detection/fire-detection:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 5000
+              protocol: TCP
+
+          env:
+            - name: MODEL_PATH
+              value: "/models/fire_detection_model.pt"
+            - name: DEVICE
+              value: "cpu"
+            - name: SCORE_THRESHOLD
+              value: "0.5"
+            - name: MAX_CONTENT_LENGTH_MB
+              value: "16"
+            - name: MAX_BATCH_SIZE
+              value: "16"
+            - name: MODEL_VERSION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['app.kubernetes.io/version']
+            - name: PYTHONUNBUFFERED
+              value: "1"
+
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+          # Loading Mask R-CNN takes a while, so give the container a startup
+          # budget of up to 5 minutes before the liveness probe takes over.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+
+          # Readiness only passes once the model is actually usable.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
       volumes:
-      - name: model-storage
-        persistentVolumeClaim:
-          claimName: model-pvc
-      - name: tmp
-        emptyDir: {}
-      
-      # Node affinity for GPU support (optional)
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: cloud.google.com/gke-nodepool
-                operator: In
-                values:
-                - default-pool
+        - name: model-storage
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: tmp
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fire-detection-config
+  namespace: default
+data:
+  # Where train.py's checkpoint was uploaded.
+  model_gcs_uri: "gs://fire-detection-models/fire_detection_model.pt"
 
 ---
 apiVersion: v1
@@ -127,11 +170,22 @@ spec:
   selector:
     app: fire-detection
   ports:
-  - name: http
-    port: 80
-    targetPort: http
-    protocol: TCP
-  sessionAffinity: ClientIP
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fire-detection-pdb
+  namespace: default
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: fire-detection
 
 ---
 apiVersion: autoscaling/v2
@@ -147,32 +201,18 @@ spec:
   minReplicas: 3
   maxReplicas: 10
   metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: 70
-  - type: Resource
-    resource:
-      name: memory
-      target:
-        type: Utilization
-        averageUtilization: 80
-
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: model-pvc
-  namespace: default
-spec:
-  accessModes:
-    - ReadOnlyMany
-  resources:
-    requests:
-      storage: 5Gi
-  storageClassName: standard
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
 
 ---
 apiVersion: v1
