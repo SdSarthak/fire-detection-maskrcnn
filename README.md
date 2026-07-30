@@ -1,363 +1,214 @@
-# Fire Detection Image Segmentation with Mask R-CNN
+# Fire Detection with Mask R-CNN
 
-Complete project for fire detection using Mask R-CNN model with image segmentation. This project includes model training, inference, and MLOps deployment on Google Cloud Platform.
+Instance segmentation of fire regions in images, plus the MLOps pipeline that
+serves the model on Google Cloud.
 
-## Project Structure
+The model is a real Mask R-CNN — ResNet50 + FPN backbone, region proposal
+network, ROI Align, box head and mask head — built on `torchvision` and
+fine-tuned from COCO weights. It outputs one mask, box and confidence score per
+fire instance, not a single image-level label.
 
 ```
 Mask R CNN/
-├── segmentation/                 # Model training and inference
+├── segmentation/            model training and inference
 │   ├── src/
-│   │   ├── config.py            # Configuration management
-│   │   ├── dataset.py           # Data loading and preprocessing
-│   │   └── model.py             # Model architecture and training
-│   ├── data/
-│   │   ├── train/               # Training images
-│   │   ├── val/                 # Validation images
-│   │   ├── test/                # Test images
-│   │   └── annotations/         # VGG Annotator JSON files
-│   ├── weights/                 # Pre-trained and trained weights
-│   ├── outputs/                 # Inference results and visualizations
-│   ├── train.py                 # Training script
-│   ├── infer.py                 # Inference script
-│   ├── requirements.txt          # Python dependencies
-│   └── README.md                # Segmentation module documentation
-│
-└── mlops/                        # MLOps deployment infrastructure
-    ├── flask_app/
-    │   ├── app.py               # Flask REST API
-    │   ├── Dockerfile           # Container image definition
-    │   ├── uwsgi.ini            # uWSGI server configuration
-    │   └── requirements.txt      # Flask dependencies
-    ├── cloudbuild/
-    │   └── cloudbuild.yaml      # Cloud Build CI/CD pipeline
-    ├── gke/
-    │   └── deployment.yaml      # Kubernetes deployment configuration
-    ├── cloud_functions/
-    │   ├── main.py              # Cloud Run Function for auto-deployment
-    │   └── requirements.txt      # Cloud Function dependencies
-    ├── DEPLOYMENT_GUIDE.md       # Complete deployment instructions
-    └── README.md                # MLOps module documentation
+│   │   ├── config.py        dataclass config, overridable via FIRE_* env vars
+│   │   ├── dataset.py       VIA annotation parsing -> torch Dataset
+│   │   ├── model.py         model construction, training loop, evaluation
+│   │   ├── metrics.py       IoU / Dice / precision / recall / AP
+│   │   └── predictor.py     inference wrapper shared by the CLI and the API
+│   ├── train.py             training entrypoint
+│   ├── infer.py             inference entrypoint
+│   ├── data/                train/ val/ test/ annotations/ (git-ignored)
+│   ├── weights/             checkpoints (git-ignored)
+│   └── outputs/             overlays and predictions.json (git-ignored)
+├── mlops/
+│   ├── flask_app/           REST API, Dockerfile, uWSGI config
+│   ├── cloudbuild/          Cloud Build CI/CD pipeline
+│   ├── gke/                 Kubernetes manifests
+│   └── cloud_functions/     Pub/Sub -> GKE rollout function
+└── tests/                   pytest suite (118 tests)
 ```
 
-## Business Overview
+## Quick start
 
-Fire detection is critical for early warning systems in forests, buildings, and industrial facilities. This project demonstrates an automated machine learning pipeline for real-time fire detection using image segmentation with Mask R-CNN.
+```bash
+git clone https://github.com/SdSarthak/fire-detection-maskrcnn.git
+cd fire-detection-maskrcnn
 
-### Key Features
+python -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
+pip install -r segmentation/requirements.txt
+pip install -r requirements-dev.txt   # only needed to run the tests
 
-- **Real-time Fire Detection**: Process images to detect fire locations
-- **Image Segmentation**: Use Mask R-CNN for precise fire region identification
-- **Automated MLOps**: Complete CI/CD pipeline on Google Cloud Platform
-- **Scalable Deployment**: Kubernetes-based containerized application
-- **REST API**: Easy integration with external systems
-- **Model Versioning**: Automatic model updates via CI/CD
+cp .env.example .env              # then edit
+```
 
-## Technologies Used
+`setup.sh` (or `setup.bat` on Windows) does the same thing in one step.
 
-### Model Training
-- **TensorFlow**: Deep learning framework
-- **Keras**: High-level neural network API
-- **Mask R-CNN**: Instance segmentation architecture
-- **OpenCV**: Image processing
+For a GPU build of PyTorch, follow the selector at
+<https://pytorch.org/get-started/locally/> instead of the pinned CPU wheels.
 
-### Deployment
-- **Docker**: Container virtualization
-- **Google Cloud Build**: CI/CD automation
-- **Artifact Registry**: Container image registry
-- **Google Kubernetes Engine (GKE)**: Container orchestration
-- **Cloud Run Functions**: Serverless compute
-- **Cloud Pub/Sub**: Event messaging
-- **Flask**: Web framework
-- **uWSGI**: Application server
+## 1. Prepare data
 
-## Project Phases
+1. Put images in `segmentation/data/train/`, `val/` and `test/`.
+2. Annotate the fire regions with the
+   [VGG Image Annotator](https://www.robots.ox.ac.uk/~vgg/software/via/).
+   Draw a polygon per fire region and set a region attribute to `fire`.
+3. Export the project as JSON to
+   `segmentation/data/annotations/train_annotations.json` (and
+   `val_annotations.json`).
 
-### Phase 1: Model Development (segmentation/)
+Both VIA export layouts are supported (flat, and the newer
+`_via_img_metadata` wrapper), as are polygon, polyline, rect, circle and
+ellipse shapes — non-polygon shapes are converted automatically.
 
-This phase covers building and training the fire detection model:
+Images without a usable annotation are skipped and reported, so a typo in a
+filename never silently trains on an empty mask.
 
-1. **Dependencies Installation**: Install required Python packages
-2. **Data Preparation**: Load and preprocess training data
-3. **Annotation Creation**: Create masks using VGG Annotator
-4. **Model Building**: Build Mask R-CNN architecture
-5. **Model Training**: Train on annotated fire images
-6. **Model Evaluation**: Validate on test data
-7. **Inference**: Run predictions on new images
-
-**Quick Start for Training:**
+## 2. Train
 
 ```bash
 cd segmentation
-pip install -r requirements.txt
-python train.py
+python train.py --epochs 30
 ```
 
-**Quick Start for Inference:**
+Useful flags:
+
+| Flag | Meaning |
+|---|---|
+| `--data-dir` / `--annotations-dir` | Point at a dataset outside the repo |
+| `--epochs`, `--batch-size`, `--lr` | Override the schedule |
+| `--pretrained coco\|imagenet\|none` | Starting weights (default `coco`) |
+| `--device auto\|cpu\|cuda` | Force a device |
+| `--class-filter fire,flame` | Which region attributes count as fire |
+| `--output` | Checkpoint path |
+
+Each epoch reports the four Mask R-CNN losses plus validation loss, precision,
+recall, F1, mean IoU and AP@0.5. The checkpoint with the best validation F1 is
+kept, and the full history is written to `outputs/training_history.json`.
+
+A checkpoint stores its own configuration, so inference rebuilds the exact
+architecture it was trained with — there is no way to load weights into a
+mismatched model.
+
+## 3. Run inference
 
 ```bash
-cd segmentation
-python infer.py
+python infer.py --input data/test --score-threshold 0.5
 ```
 
-### Phase 2: MLOps Deployment (mlops/)
+Writes an annotated overlay per image to `outputs/` and an aggregated
+`outputs/predictions.json`:
 
-This phase automates deployment on Google Cloud Platform:
+```json
+{
+  "filename": "wildfire_03.jpg",
+  "is_fire": true,
+  "confidence": 0.94,
+  "num_detections": 2,
+  "fire_area_ratio": 0.187,
+  "detections": [
+    {
+      "class_name": "fire",
+      "score": 0.94,
+      "bounding_box": {"x1": 210.4, "y1": 96.1, "x2": 512.0, "y2": 388.7},
+      "mask_area_px": 41230,
+      "polygons": [[[212, 98], [508, 104], "..."]]
+    }
+  ]
+}
+```
 
-1. **Local Development**: Test application locally
-2. **Containerization**: Create Docker image
-3. **Cloud Build**: Automated build pipeline
-4. **Image Registry**: Store images in Artifact Registry
-5. **Kubernetes Deployment**: Deploy to GKE
-6. **Auto-Scaling**: Handle traffic with HPA
-7. **Monitoring**: Track model performance
+Masks are returned as simplified polygons rather than bitmaps, so the payload
+stays small enough to log or forward to another service.
 
-**Deployment Steps:**
+## 4. Serve the API
 
 ```bash
-# See DEPLOYMENT_GUIDE.md for detailed instructions
-# Quick overview:
-
-# 1. Setup GCP
-gcloud projects create fire-detection-mlops
-gcloud services enable cloudbuild.googleapis.com artifactregistry.googleapis.com
-
-# 2. Create Artifact Registry
-gcloud artifacts repositories create fire-detection \
-  --repository-format=docker --location=us-central1
-
-# 3. Create GKE Cluster
-gcloud container clusters create fire-detection-cluster \
-  --zone us-central1-a --num-nodes 3
-
-# 4. Deploy Application
-kubectl apply -f mlops/gke/deployment.yaml
-
-# 5. Test API
-curl http://your-service-ip/health
+export MODEL_PATH=segmentation/weights/fire_detection_model.pt
+python mlops/flask_app/app.py
 ```
 
-## Data Preparation
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Liveness. Always 200 while the process is up |
+| `GET /ready` | Readiness. 503 until the model is loaded |
+| `GET /model_info` | Architecture, classes, thresholds, limits |
+| `GET /metrics` | Prometheus counters and gauges |
+| `POST /predict` | One image, form field `file` |
+| `POST /batch_predict` | Several images, form field `files` |
 
-### Image Requirements
-- Format: JPG, PNG, TIFF
-- Size: Any resolution (auto-resized to 256x256)
-- Content: Images containing fire scenes
-
-### Annotation Process
-
-1. **Use VGG Annotator**: https://www.robots.ox.ac.uk/~vgg/software/via/
-2. **Create Masks**: Draw polygons around fire regions
-3. **Export JSON**: Save annotations as `via_project.json`
-4. **Organize Data**:
-   - Place images in `segmentation/data/train/`, `val/`, `test/`
-   - Place annotations in `segmentation/data/annotations/`
-
-### Data Structure
-```
-data/
-├── train/
-│   ├── fire_image_1.jpg
-│   ├── fire_image_2.png
-│   └── ...
-├── val/
-│   ├── fire_val_1.jpg
-│   └── ...
-├── test/
-│   └── test_image.jpg
-└── annotations/
-    ├── train_annotations.json
-    ├── val_annotations.json
-    └── via_project.json
+```bash
+curl -F "file=@wildfire.jpg" http://localhost:5000/predict
+curl -F "file=@wildfire.jpg" "http://localhost:5000/predict?overlay=true"   # + base64 PNG
 ```
 
-## Model Architecture
+The API never writes uploads to disk: bytes are decoded straight into memory,
+which removes the temp-file cleanup path entirely and keeps the container's
+root filesystem read-only.
 
-### Mask R-CNN Components
+## 5. Deploy
 
-1. **Backbone**: ResNet50 for feature extraction
-2. **Region Proposal Network (RPN)**: Generates region proposals
-3. **ROI Align**: Extracts fixed-size features from proposals
-4. **Detection Head**: Classification and bounding box regression
-5. **Mask Head**: Generates segmentation masks
-
-### Configuration
-
-Model training is controlled by `src/config.py`:
-
-```python
-class FireDetectionConfig:
-    NUM_CLASSES = 2  # Background + Fire
-    IMAGE_MIN_DIM = 256
-    IMAGE_MAX_DIM = 512
-    TRAIN_EPOCHS = 50
-    LEARNING_RATE = 0.001
-    DETECTION_MIN_CONFIDENCE = 0.7
+```bash
+docker build -t fire-detection -f mlops/flask_app/Dockerfile .
+docker run -p 5000:5000 -v "$PWD/segmentation/weights:/models:ro" fire-detection
 ```
 
-## API Endpoints
+On Google Cloud the flow is: push to GitHub → Cloud Build builds and pushes the
+image to Artifact Registry → a Pub/Sub message fires → a Cloud Run Function
+patches the GKE deployment → rolling update with zero downtime.
 
-### Health Check
-```http
-GET /health
+See [`mlops/DEPLOYMENT_GUIDE.md`](mlops/DEPLOYMENT_GUIDE.md) for the full setup
+and [`mlops/README.md`](mlops/README.md) for how the pieces fit together.
+
+## Configuration
+
+Every field of `FireDetectionConfig` can be set with a `FIRE_<FIELD>`
+environment variable, and the serving app reads its own `MODEL_PATH`,
+`DEVICE`, `SCORE_THRESHOLD` and friends. See `.env.example` for the full list.
+
+```bash
+FIRE_LEARNING_RATE=0.001 FIRE_TRAIN_EPOCHS=50 python train.py
 ```
 
-### Model Information
-```http
-GET /model_info
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
 ```
 
-### Single Image Prediction
-```http
-POST /predict
-Content-Type: multipart/form-data
-Body: file=<image>
-```
+118 tests covering VIA parsing and mask rasterisation, the metrics, the torch
+dataset, model construction and a real training step, checkpoint round-trips,
+the Flask API and the Cloud Function. The model tests run on CPU with
+randomly initialised weights and 64x48 images, so the whole suite finishes in
+about 15 seconds without downloading anything.
 
-### Batch Prediction
-```http
-POST /batch_predict
-Content-Type: multipart/form-data
-Body: files=<image1>&files=<image2>&...
-```
+## Metrics
 
-## Performance Metrics
+Evaluation matches predicted masks to ground truth greedily by descending
+score, with each ground-truth instance claimed at most once, then reports:
 
-The model is evaluated on:
-- **Accuracy**: Classification accuracy for fire/no-fire
-- **Precision**: True positive rate of fire detections
-- **Recall**: Detection of all actual fires
-- **F1 Score**: Harmonic mean of precision and recall
-- **mAP (mean Average Precision)**: Detection quality
-- **IoU (Intersection over Union)**: Segmentation quality
+- **Precision / recall / F1** at an IoU threshold (default 0.5)
+- **Mean IoU** and **mean Dice** over matched pairs
+- **AP@0.5** with all-point interpolation
 
-## Deployment Architecture
+## Notes and limitations
 
-```
-Developer/ML Engineer
-        ↓
-   GitHub Commit
-        ↓
-  Cloud Build (Trigger)
-        ↓
-  Build Docker Image → Artifact Registry
-        ↓
- Pub/Sub Message (Image Ready)
-        ↓
- Cloud Run Function (Listen)
-        ↓
-  Update GKE Deployment
-        ↓
-  Rolling Update → New Pods Start
-        ↓
- Load Balancer Routes Traffic
-        ↓
-    Flask API (uWSGI)
-        ↓
-     End Users
-```
-
-## Continuous Integration/Deployment
-
-### Build Process
-1. Code pushed to GitHub
-2. Cloud Build automatically triggered
-3. Dependencies installed
-4. Docker image built
-5. Image pushed to Artifact Registry
-6. Pub/Sub message published
-7. Cloud Run Function receives notification
-8. GKE deployment updated with new image
-9. Rolling update ensures zero downtime
-
-### Monitoring
-- Cloud Build logs: `gcloud builds log <ID>`
-- GKE pod logs: `kubectl logs -f deployment/fire-detection`
-- Cloud Logging: View all application logs
-
-## Cost Estimation
-
-Using GCP services incurs costs. Estimated monthly costs:
-
-| Service | Estimated Cost |
-|---------|----------------|
-| GKE Cluster (3 nodes) | $150-200 |
-| Cloud Build | $0.003 per build minute |
-| Artifact Registry | $0.10 per GB/month storage |
-| Cloud Run Functions | Pay per invocation |
-| **Total Estimate** | **$200-300/month** |
-
-Use [GCP Cost Calculator](https://cloud.google.com/products/calculator) for accurate estimates.
-
-## Security Considerations
-
-1. **Image Scanning**: Scan Docker images for vulnerabilities
-2. **Network Policies**: Restrict pod-to-pod communication
-3. **RBAC**: Implement role-based access control
-4. **Secrets Management**: Use GCP Secret Manager
-5. **Audit Logging**: Enable Cloud Audit Logs
-6. **SSL/TLS**: Use HTTPS for API communication
-7. **Pod Security**: Run containers as non-root
-
-## Troubleshooting
-
-### Training Issues
-- Ensure annotation files are in correct JSON format
-- Check image file formats are supported
-- Verify sufficient GPU memory (if using GPU)
-
-### Deployment Issues
-- Check Cloud Build logs for build failures
-- Verify GKE cluster is running: `gcloud container clusters list`
-- Check pod logs: `kubectl logs <pod-name>`
-- Verify service is accessible: `kubectl get svc`
-
-### Model Issues
-- Ensure model weights file is uploaded to GCS
-- Check MODEL_PATH environment variable in Kubernetes
-- Verify model is not corrupted: `file model.h5`
-
-## Contributing
-
-To contribute improvements:
-
-1. Create a feature branch
-2. Make changes and test locally
-3. Commit with descriptive messages
-4. Push to GitHub to trigger CI/CD
-5. Monitor deployment in Cloud Build
+- Fire is a single class. Adding smoke means extending `CLASS_NAMES` and
+  `NUM_CLASSES`, then retraining.
+- Inference is CPU-friendly but not real-time; a 512px image takes roughly a
+  second per core. Use a GPU node pool for video-rate throughput.
+- Model weights, datasets and `.env` are git-ignored. Ship checkpoints through
+  Cloud Storage, not the repository.
 
 ## References
 
-- [Mask R-CNN Paper](https://arxiv.org/abs/1703.06870)
-- [Matterport Mask R-CNN Implementation](https://github.com/matterport/Mask_RCNN)
-- [GCP Documentation](https://cloud.google.com/docs)
-- [Kubernetes Documentation](https://kubernetes.io/docs/)
-- [TensorFlow Documentation](https://www.tensorflow.org/api_docs)
-
-## Next Steps
-
-1. **Prepare Data**: Gather and annotate fire detection images
-2. **Train Model**: Run training script with your data
-3. **Test Locally**: Use inference script for validation
-4. **Setup GCP**: Follow deployment guide
-5. **Deploy**: Push to GitHub to trigger CI/CD
-6. **Monitor**: Watch Cloud Build and GKE metrics
-7. **Optimize**: Tune hyperparameters based on metrics
+- [Mask R-CNN](https://arxiv.org/abs/1703.06870) (He et al., 2017)
+- [torchvision detection models](https://pytorch.org/vision/stable/models.html#object-detection-instance-segmentation-and-person-keypoint-detection)
+- [VGG Image Annotator](https://www.robots.ox.ac.uk/~vgg/software/via/)
 
 ## License
 
-This project is provided as-is for educational and research purposes.
-
-## Support
-
-For issues and questions:
-- Check troubleshooting section above
-- Review GCP documentation
-- Check GitHub issues
-- Contact project maintainer
-
----
-
-**Last Updated**: January 29, 2024
-**Version**: 1.0.0
+MIT

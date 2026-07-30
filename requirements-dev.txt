@@ -1,0 +1,11 @@
+# Everything needed to run the test suite.
+-r segmentation/requirements.txt
+
+pytest>=7.2.0
+flask>=2.2.0,<4
+werkzeug>=2.2.0,<4
+PyYAML>=6.0
+
+# Only exercised by tests/test_cloud_function.py; the tests skip when absent.
+functions-framework>=3.4.0
+kubernetes>=26.1.0
