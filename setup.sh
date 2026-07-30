@@ -1,106 +1,58 @@
-#!/bin/bash
-# Setup script for Mask R-CNN Fire Detection project
-# Initializes project structure, installs dependencies, and prepares for deployment
+#!/usr/bin/env bash
+# Set up a local development environment for the fire detection project.
+set -euo pipefail
 
-set -e
+cd "$(dirname "$0")"
 
-echo "=================================="
-echo "Mask R-CNN Fire Detection - Setup"
-echo "=================================="
+GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; NC='\033[0m'
+info()  { printf "${BLUE}%s${NC}\n" "$*"; }
+ok()    { printf "${GREEN}  %s${NC}\n" "$*"; }
+warn()  { printf "${YELLOW}%s${NC}\n" "$*"; }
 
-# Colors for output
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+PYTHON="${PYTHON:-python3}"
+command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python
+command -v "$PYTHON" >/dev/null 2>&1 || { warn "Python 3.9+ is required but was not found."; exit 1; }
 
-# Check Python version
-echo -e "${BLUE}Step 1: Checking Python version...${NC}"
-python_version=$(python --version 2>&1 | awk '{print $2}')
-echo "Python version: $python_version"
+info "Python: $("$PYTHON" --version 2>&1)"
 
-if ! command -v python &> /dev/null; then
-    echo -e "${YELLOW}Warning: Python not found. Please install Python 3.9+${NC}"
-    exit 1
+info "1/4 Creating the virtual environment..."
+if [ ! -d venv ]; then
+  "$PYTHON" -m venv venv
+fi
+# shellcheck disable=SC1091
+if [ -f venv/bin/activate ]; then . venv/bin/activate; else . venv/Scripts/activate; fi
+ok "venv ready"
+
+info "2/4 Installing dependencies..."
+python -m pip install --quiet --upgrade pip setuptools wheel
+python -m pip install --quiet -r requirements-dev.txt
+ok "dependencies installed"
+
+info "3/4 Creating project directories..."
+mkdir -p segmentation/data/train segmentation/data/val segmentation/data/test \
+         segmentation/data/annotations segmentation/weights segmentation/outputs
+ok "directories ready"
+
+info "4/4 Preparing configuration..."
+if [ ! -f .env ]; then
+  cp .env.example .env
+  ok ".env created from .env.example -- edit it before deploying"
+else
+  ok ".env already exists, left untouched"
 fi
 
-# Create virtual environment for segmentation
-echo -e "${BLUE}Step 2: Setting up segmentation environment...${NC}"
-cd segmentation
+cat <<'EOF'
 
-if [ ! -d "venv" ]; then
-    echo "Creating virtual environment..."
-    python -m venv venv
-fi
+Setup complete.
 
-# Activate virtual environment
-if [ -f "venv/Scripts/activate" ]; then
-    source venv/Scripts/activate
-elif [ -f "venv/bin/activate" ]; then
-    source venv/bin/activate
-fi
+Next steps
+  1. Add images to segmentation/data/{train,val,test}/ and export VIA
+     annotations to segmentation/data/annotations/.
+  2. Train:      cd segmentation && python train.py --epochs 30
+  3. Infer:      cd segmentation && python infer.py --input data/test
+  4. Serve:      MODEL_PATH=segmentation/weights/fire_detection_model.pt \
+                   python mlops/flask_app/app.py
+  5. Test:       pytest
+  6. Deploy:     see mlops/DEPLOYMENT_GUIDE.md
 
-echo -e "${GREEN}✓ Virtual environment created${NC}"
-
-# Install segmentation dependencies
-echo -e "${BLUE}Step 3: Installing segmentation dependencies...${NC}"
-pip install --upgrade pip setuptools wheel
-pip install -r requirements.txt
-echo -e "${GREEN}✓ Dependencies installed${NC}"
-
-# Create necessary directories
-echo -e "${BLUE}Step 4: Creating project directories...${NC}"
-mkdir -p data/train data/val data/test data/annotations
-mkdir -p weights
-mkdir -p outputs
-echo -e "${GREEN}✓ Directories created${NC}"
-
-cd ..
-
-# Setup Flask application
-echo -e "${BLUE}Step 5: Setting up Flask application...${NC}"
-cd mlops/flask_app
-
-if [ ! -d "uploads" ]; then
-    mkdir -p uploads
-    echo -e "${GREEN}✓ Flask upload directory created${NC}"
-fi
-
-cd ../..
-
-# Display setup summary
-echo ""
-echo -e "${GREEN}=================================="
-echo "Setup Complete!"
-echo "==================================${NC}"
-echo ""
-echo "Project structure:"
-echo "  segmentation/        - Model training and inference"
-echo "  mlops/               - Deployment infrastructure"
-echo ""
-echo "Next steps:"
-echo -e "${YELLOW}1. Prepare training data:${NC}"
-echo "   - Place images in segmentation/data/train/, val/, test/"
-echo "   - Create annotations using VGG Annotator"
-echo "   - Place JSON files in segmentation/data/annotations/"
-echo ""
-echo -e "${YELLOW}2. Train the model:${NC}"
-echo "   cd segmentation"
-echo "   python train.py"
-echo ""
-echo -e "${YELLOW}3. Run inference:${NC}"
-echo "   python infer.py"
-echo ""
-echo -e "${YELLOW}4. Deploy to GCP:${NC}"
-echo "   Read mlops/DEPLOYMENT_GUIDE.md for detailed instructions"
-echo ""
-echo -e "${YELLOW}5. Local Docker testing:${NC}"
-echo "   docker build -t fire-detection -f mlops/flask_app/Dockerfile ."
-echo "   docker run -p 5000:5000 fire-detection"
-echo ""
-echo "Documentation:"
-echo "  - README.md               - Project overview"
-echo "  - segmentation/README.md  - Model training guide"
-echo "  - mlops/README.md         - Deployment guide"
-echo "  - mlops/DEPLOYMENT_GUIDE.md - Complete GCP setup"
-echo ""
+EOF
