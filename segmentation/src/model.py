@@ -67,10 +67,14 @@ def build_model(config: Optional[FireDetectionConfig] = None) -> nn.Module:
         aspect_ratios=(tuple(config.RPN_ANCHOR_RATIOS),) * len(anchor_sizes),
     )
 
+    # torchvision only honours (and only warns about) this when weights are loaded.
+    trainable_layers = (config.TRAINABLE_BACKBONE_LAYERS
+                        if (detection_weights or backbone_weights) else None)
+
     model = torchvision.models.detection.maskrcnn_resnet50_fpn(
         weights=detection_weights,
         weights_backbone=backbone_weights,
-        trainable_backbone_layers=config.TRAINABLE_BACKBONE_LAYERS,
+        trainable_backbone_layers=trainable_layers,
         min_size=config.IMAGE_MIN_DIM,
         max_size=config.IMAGE_MAX_DIM,
         rpn_anchor_generator=anchor_generator,
