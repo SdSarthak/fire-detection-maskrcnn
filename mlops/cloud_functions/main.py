@@ -77,9 +77,33 @@ def decode_pubsub_message(cloud_event) -> Dict[str, Any]:
             decoded = str(payload).encode('utf-8')
 
     try:
-        return json.loads(decoded.decode('utf-8'))
+        body = json.loads(decoded.decode('utf-8'))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f'Pub/Sub message was not valid JSON: {exc}') from exc
+
+    # A JSON array or scalar is valid JSON but has no .get(); without this the
+    # handler would raise AttributeError and the function would 500 instead of
+    # rejecting the message.
+    if not isinstance(body, dict):
+        raise ValueError(
+            'Pub/Sub message must be a JSON object with an "image_uri" field; '
+            f'got {type(body).__name__}')
+    return body
+
+
+def validate_image_uri(value: Any) -> str:
+    """Check the image reference before it is written into a Deployment patch."""
+    if not isinstance(value, str):
+        raise ValueError(
+            f'image_uri must be a string, got {type(value).__name__}')
+    uri = value.strip()
+    if not uri:
+        raise ValueError('image_uri is empty')
+    if len(uri) > 512:
+        raise ValueError(f'image_uri is implausibly long ({len(uri)} characters)')
+    if any(character.isspace() for character in uri):
+        raise ValueError('image_uri must not contain whitespace')
+    return uri
 
 
 def load_kubernetes_config() -> None:
@@ -149,13 +173,19 @@ def update_deployment(cloud_event) -> Tuple[Dict[str, Any], int]:
         logger.error('Malformed Pub/Sub message: %s', exc)
         return {'status': 'error', 'message': str(exc)}, 400
 
-    image_uri = message.get('image_uri')
     build_id = message.get('build_id')
-    logger.info('Received build %s for image %s', build_id, image_uri)
+    raw_image_uri = message.get('image_uri')
+    logger.info('Received build %s for image %s', build_id, raw_image_uri)
 
-    if not image_uri:
+    if raw_image_uri is None or raw_image_uri == '':
         logger.error('Message is missing image_uri: %s', message)
         return {'status': 'error', 'message': 'Missing image_uri'}, 400
+
+    try:
+        image_uri = validate_image_uri(raw_image_uri)
+    except ValueError as exc:
+        logger.error('Rejecting image_uri %r: %s', raw_image_uri, exc)
+        return {'status': 'error', 'message': str(exc)}, 400
 
     try:
         settings = get_settings()

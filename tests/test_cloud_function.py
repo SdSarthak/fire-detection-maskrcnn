@@ -148,3 +148,66 @@ def test_handler_reports_a_failed_rollout(settings, monkeypatch):
 
     assert status == 500
     assert body['status'] == 'error'
+
+
+# --------------------------------------------------------------------------- #
+# Malformed payloads (Pass 2)
+# --------------------------------------------------------------------------- #
+def test_json_array_payload_is_rejected_not_crashed():
+    """A JSON array is valid JSON but has no .get(); this used to 500."""
+    with pytest.raises(ValueError, match='JSON object'):
+        cloud_function.decode_pubsub_message(pubsub_event(['image:latest']))
+
+
+def test_json_scalar_payload_is_rejected():
+    with pytest.raises(ValueError, match='JSON object'):
+        cloud_function.decode_pubsub_message(pubsub_event('image:latest'))
+
+
+def test_handler_returns_400_for_an_array_payload(settings):
+    body, status = cloud_function.update_deployment(pubsub_event([1, 2, 3]))
+    assert status == 400
+    assert body['status'] == 'error'
+
+
+@pytest.mark.parametrize('value', [
+    123,
+    ['gcr.io/p/i:1'],
+    {'uri': 'gcr.io/p/i:1'},
+    'gcr.io/p/i:1 --privileged',
+    'gcr.io/p/i:1\nsomething-else',
+    '   ',
+])
+def test_implausible_image_uris_are_rejected(value):
+    with pytest.raises(ValueError):
+        cloud_function.validate_image_uri(value)
+
+
+def test_overlong_image_uri_is_rejected():
+    with pytest.raises(ValueError, match='implausibly long'):
+        cloud_function.validate_image_uri('gcr.io/p/' + 'a' * 600)
+
+
+def test_valid_image_uri_is_trimmed_and_returned():
+    assert cloud_function.validate_image_uri('  gcr.io/p/i:sha256-abc  ') == \
+        'gcr.io/p/i:sha256-abc'
+
+
+def test_handler_rejects_a_non_string_image_uri(settings):
+    body, status = cloud_function.update_deployment(
+        pubsub_event({'image_uri': 42, 'build_id': 'b1'}))
+
+    assert status == 400
+    assert 'must be a string' in body['message']
+
+
+def test_handler_rejects_an_image_uri_with_whitespace(settings, monkeypatch):
+    patched = []
+    monkeypatch.setattr(cloud_function, 'update_gke_deployment',
+                        lambda *a, **k: patched.append(a) or True)
+
+    body, status = cloud_function.update_deployment(
+        pubsub_event({'image_uri': 'gcr.io/p/i:1 evil'}))
+
+    assert status == 400
+    assert patched == []
