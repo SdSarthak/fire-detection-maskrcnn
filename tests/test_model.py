@@ -17,7 +17,7 @@ from src.model import (build_model, compute_validation_loss, create_optimizer,
                        create_scheduler, evaluate, load_checkpoint, load_model,
                        masks_to_numpy, resolve_device, save_checkpoint,
                        set_seed, train_one_epoch)
-from src.predictor import FirePredictor, mask_to_polygons
+from src.predictor import FirePredictor, mask_to_polygons, validate_image
 
 
 @pytest.fixture(scope='module')
@@ -355,3 +355,83 @@ def test_evaluate_restores_the_previous_module_mode(tiny_config, tiny_model,
         assert tiny_model.training is True
     finally:
         tiny_model.eval()
+
+
+# --------------------------------------------------------------------------- #
+# Predictor input guards and overlay rendering (Pass 2)
+# --------------------------------------------------------------------------- #
+def test_validate_image_rejects_oversized_arrays():
+    with pytest.raises(ValueError, match='too large'):
+        validate_image(np.zeros((100, 100, 3), dtype=np.uint8), max_pixels=1000)
+
+
+def test_validate_image_rejects_zero_dimensions():
+    with pytest.raises(ValueError, match='zero dimension'):
+        validate_image(np.zeros((0, 10, 3), dtype=np.uint8))
+
+
+def test_validate_image_rejects_wrong_rank():
+    with pytest.raises(ValueError, match='HW or HWC'):
+        validate_image(np.zeros((2, 3, 4, 5), dtype=np.uint8))
+
+
+def test_validate_image_accepts_a_normal_frame():
+    image = make_fire_image()
+    assert validate_image(image) is not None
+
+
+def test_predictor_rejects_out_of_range_thresholds(tiny_model, tiny_config):
+    with pytest.raises(ValueError, match='score_threshold'):
+        FirePredictor(tiny_model, tiny_config, 'cpu', score_threshold=1.5)
+    with pytest.raises(ValueError, match='mask_threshold'):
+        FirePredictor(tiny_model, tiny_config, 'cpu', mask_threshold=-0.2)
+
+
+def test_predict_batch_refuses_an_oversized_image(tiny_model, tiny_config):
+    predictor = FirePredictor(tiny_model, tiny_config, 'cpu', max_image_pixels=16)
+    with pytest.raises(ValueError, match='too large'):
+        predictor.predict(make_fire_image())
+
+
+def test_predict_batch_on_an_empty_sequence_returns_nothing(tiny_model, tiny_config):
+    predictor = FirePredictor(tiny_model, tiny_config, 'cpu')
+    assert predictor.predict_batch([]) == []
+
+
+def _blank_result(height, width):
+    return {'detections': [], 'masks': np.zeros((0, height, width), dtype=bool)}
+
+
+def test_overlay_of_a_float_image_is_not_rendered_black():
+    """astype(uint8) on a [0, 1] float image collapses everything to zero."""
+    image = np.full((16, 16, 3), 0.75, dtype=np.float32)
+
+    overlay = FirePredictor.render_overlay(None, image, _blank_result(16, 16))
+
+    assert overlay.dtype == np.uint8
+    assert int(overlay.max()) > 0
+
+
+def test_overlay_drops_an_alpha_channel():
+    image = np.zeros((12, 12, 4), dtype=np.uint8)
+    overlay = FirePredictor.render_overlay(None, image, _blank_result(12, 12))
+    assert overlay.shape == (12, 12, 3)
+
+
+def test_overlay_of_a_grayscale_image_is_rgb():
+    image = np.full((10, 10), 120, dtype=np.uint8)
+    overlay = FirePredictor.render_overlay(None, image, _blank_result(10, 10))
+    assert overlay.shape == (10, 10, 3)
+
+
+def test_overlay_survives_a_mask_from_a_different_image_size():
+    image = make_fire_image(20, 20)
+    result = {
+        'detections': [{'class_name': 'fire', 'score': 0.9,
+                        'bounding_box': {'x1': 1, 'y1': 1, 'x2': 5, 'y2': 5}}],
+        'masks': np.ones((1, 40, 40), dtype=bool),
+    }
+
+    overlay = FirePredictor.render_overlay(None, image, result)
+
+    assert overlay.shape == (20, 20, 3)

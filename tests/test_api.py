@@ -273,3 +273,171 @@ def test_decode_image_rejects_empty_payload():
 ])
 def test_allowed_file(filename, expected):
     assert flask_app.allowed_file(filename) is expected
+
+
+# --------------------------------------------------------------------------- #
+# Decoded-size limits and environment parsing (Pass 2)
+# --------------------------------------------------------------------------- #
+def test_decode_rejects_a_decompression_bomb(monkeypatch):
+    """A tiny upload can decode to an enormous array; the body limit misses it."""
+    bomb = np.zeros((2000, 2000, 3), dtype=np.uint8)
+    encoded = png_bytes(bomb)
+    assert len(encoded) < 100_000  # a few kB on the wire
+
+    monkeypatch.setattr(flask_app, 'MAX_IMAGE_PIXELS', 1_000_000)
+    with pytest.raises(ValueError, match='too large'):
+        flask_app.decode_image(encoded)
+
+
+def test_decode_accepts_an_image_inside_the_pixel_limit(monkeypatch):
+    monkeypatch.setattr(flask_app, 'MAX_IMAGE_PIXELS', 1_000_000)
+    decoded = flask_app.decode_image(png_bytes())
+    assert decoded.shape == (48, 64, 3)
+
+
+def test_oversized_image_is_a_400_not_a_500(client, loaded, monkeypatch):
+    monkeypatch.setattr(flask_app, 'MAX_IMAGE_PIXELS', 100)
+
+    response = client.post('/predict', data={'file': upload()},
+                           content_type='multipart/form-data')
+
+    assert response.status_code == 400
+    assert 'too large' in response.json['error']
+
+
+def test_decode_rejects_empty_upload():
+    with pytest.raises(ValueError, match='Empty file'):
+        flask_app.decode_image(b'')
+
+
+def test_decode_rejects_non_image_bytes():
+    with pytest.raises(ValueError, match='corrupt'):
+        flask_app.decode_image(b'this is definitely not a png')
+
+
+@pytest.mark.parametrize('raw,cast,kwargs', [
+    ('half', float, {}),
+    ('', int, {}),
+    ('12.5', int, {}),
+])
+def test_env_number_rejects_unparseable_values(monkeypatch, raw, cast, kwargs):
+    monkeypatch.setenv('FIRE_TEST_VAR', raw)
+    if raw == '':
+        assert flask_app._env_number('FIRE_TEST_VAR', 7, cast, **kwargs) == 7
+        return
+    with pytest.raises(ValueError, match='FIRE_TEST_VAR'):
+        flask_app._env_number('FIRE_TEST_VAR', 7, cast, **kwargs)
+
+
+def test_env_number_enforces_bounds(monkeypatch):
+    monkeypatch.setenv('FIRE_TEST_VAR', '5')
+    with pytest.raises(ValueError, match='must be <= 1'):
+        flask_app._env_number('FIRE_TEST_VAR', 0.5, float, 0.0, 1.0)
+    with pytest.raises(ValueError, match='must be >= 10'):
+        flask_app._env_number('FIRE_TEST_VAR', 0.5, float, 10.0)
+
+
+def test_env_number_falls_back_to_the_default_when_unset(monkeypatch):
+    monkeypatch.delenv('FIRE_TEST_VAR', raising=False)
+    assert flask_app._env_number('FIRE_TEST_VAR', 3, int) == 3
+
+
+# --------------------------------------------------------------------------- #
+# Model load back-off (Pass 2)
+# --------------------------------------------------------------------------- #
+def test_failed_model_load_is_not_retried_on_every_request(client, monkeypatch):
+    attempts = []
+
+    def explode(*args, **kwargs):
+        attempts.append(1)
+        raise FileNotFoundError('no checkpoint')
+
+    flask_app.set_predictor(None)
+    monkeypatch.setattr(flask_app, '_load_error', None)
+    monkeypatch.setattr(flask_app.FirePredictor, 'from_checkpoint',
+                        staticmethod(explode))
+    monkeypatch.setattr(flask_app, 'MODEL_LOAD_RETRY_SECONDS', 3600.0)
+
+    for _ in range(5):
+        assert flask_app.get_predictor() is None
+
+    assert len(attempts) == 1
+    assert '/ready' and client.get('/ready').status_code == 503
+    flask_app._next_load_attempt = 0.0
+
+
+def test_model_load_is_retried_once_the_backoff_expires(client, monkeypatch):
+    attempts = []
+
+    def explode(*args, **kwargs):
+        attempts.append(1)
+        raise FileNotFoundError('no checkpoint')
+
+    flask_app.set_predictor(None)
+    monkeypatch.setattr(flask_app.FirePredictor, 'from_checkpoint',
+                        staticmethod(explode))
+    monkeypatch.setattr(flask_app, 'MODEL_LOAD_RETRY_SECONDS', 0.0)
+
+    flask_app.get_predictor()
+    flask_app.get_predictor()
+
+    assert len(attempts) == 2
+    flask_app._next_load_attempt = 0.0
+
+
+def test_set_predictor_clears_the_backoff():
+    flask_app._next_load_attempt = float('inf')
+    stub = StubPredictor()
+    flask_app.set_predictor(stub)
+    assert flask_app._next_load_attempt == 0.0
+    assert flask_app.get_predictor() is stub
+    flask_app.set_predictor(None)
+
+
+def test_model_info_advertises_the_pixel_limit(client, loaded):
+    assert client.get('/model_info').json['max_image_pixels'] == \
+        flask_app.MAX_IMAGE_PIXELS
+
+
+# --------------------------------------------------------------------------- #
+# Failure isolation in batch mode (Pass 2)
+# --------------------------------------------------------------------------- #
+def test_batch_keeps_going_when_one_file_is_corrupt(client, loaded):
+    response = client.post('/batch_predict', data={
+        'files': [upload('good.png'), upload('bad.png', b'not an image')],
+    }, content_type='multipart/form-data')
+
+    assert response.status_code == 200
+    body = response.json
+    assert body['succeeded'] == 1 and body['failed'] == 1
+    statuses = {r['filename']: r['status'] for r in body['results']}
+    assert statuses == {'good.png': 'success', 'bad.png': 'error'}
+
+
+def test_unexpected_batch_failure_does_not_leak_internals(client, loaded,
+                                                          monkeypatch):
+    def boom(image):
+        raise RuntimeError('/secret/path/to/model.pt is missing')
+
+    monkeypatch.setattr(loaded, 'predict', boom)
+
+    response = client.post('/batch_predict', data={'files': [upload()]},
+                           content_type='multipart/form-data')
+
+    assert response.status_code == 200
+    assert response.json['results'][0]['error'] == 'Prediction failed'
+    assert 'secret' not in response.get_data(as_text=True)
+
+
+def test_unexpected_single_failure_does_not_leak_internals(client, loaded,
+                                                           monkeypatch):
+    def boom(image):
+        raise RuntimeError('/secret/path/to/model.pt is missing')
+
+    monkeypatch.setattr(loaded, 'predict', boom)
+
+    response = client.post('/predict', data={'file': upload()},
+                           content_type='multipart/form-data')
+
+    assert response.status_code == 500
+    assert 'secret' not in response.get_data(as_text=True)

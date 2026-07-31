@@ -23,6 +23,32 @@ _OVERLAY_COLORS = (
     (0, 200, 255), (140, 0, 255), (0, 255, 140),
 )
 
+# A 40 kB PNG can decode to 30000x30000 px (~2.7 GB as float32 CHW). Cap the
+# decoded size so a hostile or accidental upload cannot exhaust memory.
+DEFAULT_MAX_IMAGE_PIXELS = 40_000_000  # ~ 6300 x 6300
+
+
+def validate_image(image: np.ndarray,
+                   max_pixels: int = DEFAULT_MAX_IMAGE_PIXELS) -> np.ndarray:
+    """Reject images the inference path cannot safely handle.
+
+    Raises ``ValueError`` for empty, wrongly-shaped or absurdly large arrays.
+    The pixel cap matters most on the serving path: HTTP body limits bound the
+    *compressed* size, not the decoded one.
+    """
+    array = np.asarray(image)
+    if array.ndim not in (2, 3):
+        raise ValueError(
+            f'Expected an HW or HWC image, got an array of shape {array.shape}')
+    height, width = array.shape[:2]
+    if height <= 0 or width <= 0:
+        raise ValueError(f'Image has a zero dimension: {width}x{height}')
+    if max_pixels and height * width > max_pixels:
+        raise ValueError(
+            f'Image is too large: {width}x{height} = {height * width:,} pixels '
+            f'(limit {max_pixels:,}). Downscale it before submitting.')
+    return array
+
 
 def mask_to_polygons(mask: np.ndarray, epsilon_ratio: float = 0.004,
                      max_points: int = 80) -> List[List[List[int]]]:
@@ -58,7 +84,8 @@ class FirePredictor:
 
     def __init__(self, model, config: FireDetectionConfig, device=None,
                  score_threshold: Optional[float] = None,
-                 mask_threshold: Optional[float] = None):
+                 mask_threshold: Optional[float] = None,
+                 max_image_pixels: int = DEFAULT_MAX_IMAGE_PIXELS):
         self.model = model
         self.config = config
         self.device = resolve_device(device) if isinstance(device, str) or device is None \
@@ -67,6 +94,13 @@ class FirePredictor:
             config.DETECTION_MIN_CONFIDENCE if score_threshold is None else score_threshold)
         self.mask_threshold = float(
             config.MASK_BINARY_THRESHOLD if mask_threshold is None else mask_threshold)
+        if not 0.0 <= self.score_threshold <= 1.0:
+            raise ValueError(
+                f'score_threshold must be in [0, 1]; got {self.score_threshold}')
+        if not 0.0 <= self.mask_threshold <= 1.0:
+            raise ValueError(
+                f'mask_threshold must be in [0, 1]; got {self.mask_threshold}')
+        self.max_image_pixels = int(max_image_pixels)
         self.class_names = list(config.CLASS_NAMES)
         self.model.eval()
 
@@ -107,8 +141,14 @@ class FirePredictor:
         """Segment several RGB images in one forward pass."""
         if not images:
             return []
+        images = [validate_image(image, self.max_image_pixels) for image in images]
         tensors = [image_to_tensor(image).to(self.device) for image in images]
-        outputs = self.model(tensors)
+        try:
+            outputs = self.model(tensors)
+        finally:
+            # Drop the device copies as soon as the forward pass is done rather
+            # than waiting for the whole batch of results to be built.
+            del tensors
         return [self._build_result(output, image)
                 for output, image in zip(outputs, images)]
 
@@ -123,6 +163,7 @@ class FirePredictor:
     def _build_result(self, output: Dict[str, torch.Tensor],
                       image: np.ndarray) -> Dict[str, Any]:
         height, width = image.shape[:2]
+        pixels = float(max(height * width, 1))
         scores = output['scores'].detach().cpu().numpy()
         keep = scores >= self.score_threshold
 
@@ -145,7 +186,7 @@ class FirePredictor:
                     'x2': round(x2, 2), 'y2': round(y2, 2),
                 },
                 'mask_area_px': area,
-                'mask_area_ratio': round(area / float(height * width), 6),
+                'mask_area_ratio': round(area / pixels, 6),
                 'polygons': mask_to_polygons(mask),
             })
 
@@ -158,7 +199,7 @@ class FirePredictor:
             'num_detections': len(detections),
             'is_fire': len(detections) > 0,
             'confidence': float(scores.max()) if len(scores) else 0.0,
-            'fire_area_ratio': round(fire_pixels / float(height * width), 6),
+            'fire_area_ratio': round(fire_pixels / pixels, 6),
             'fire_area_px': fire_pixels,
             'image_size': {'height': int(height), 'width': int(width)},
             'score_threshold': self.score_threshold,
@@ -174,10 +215,20 @@ class FirePredictor:
     def render_overlay(self, image: np.ndarray, result: Dict[str, Any],
                        alpha: float = 0.45) -> np.ndarray:
         """Draw masks, boxes and labels onto a copy of the RGB image."""
-        canvas = np.ascontiguousarray(image.copy())
+        canvas = np.ascontiguousarray(np.asarray(image).copy())
         if canvas.ndim == 2:
             canvas = cv2.cvtColor(canvas, cv2.COLOR_GRAY2RGB)
-        canvas = canvas.astype(np.uint8)
+        elif canvas.ndim == 3 and canvas.shape[2] == 4:
+            canvas = canvas[:, :, :3]
+        if canvas.dtype != np.uint8:
+            # A float image in [0, 1] would render as solid black under a plain
+            # astype(uint8); rescale it instead.
+            canvas = np.asarray(canvas, dtype=np.float64)
+            peak = float(np.nanmax(canvas)) if canvas.size else 0.0
+            if np.isfinite(peak) and peak <= 1.0:
+                canvas = canvas * 255.0
+            canvas = np.clip(np.nan_to_num(canvas), 0, 255).astype(np.uint8)
+        canvas = np.ascontiguousarray(canvas)
 
         masks = result.get('masks')
         detections = result.get('detections', [])
@@ -186,7 +237,9 @@ class FirePredictor:
             color = _OVERLAY_COLORS[index % len(_OVERLAY_COLORS)]
 
             if masks is not None and index < len(masks):
-                mask = masks[index].astype(bool)
+                mask = np.asarray(masks[index]).astype(bool)
+                if mask.shape != canvas.shape[:2]:
+                    mask = np.zeros(canvas.shape[:2], dtype=bool)
                 if mask.any():
                     tint = np.zeros_like(canvas)
                     tint[mask] = color

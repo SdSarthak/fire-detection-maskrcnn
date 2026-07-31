@@ -16,7 +16,6 @@ import os
 import sys
 import threading
 import time
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -46,17 +45,47 @@ _SEGMENTATION_ROOT = _segmentation_root()
 if _SEGMENTATION_ROOT and str(_SEGMENTATION_ROOT) not in sys.path:
     sys.path.insert(0, str(_SEGMENTATION_ROOT))
 
-from src.predictor import FirePredictor  # noqa: E402  (path set up above)
+from src.predictor import (DEFAULT_MAX_IMAGE_PIXELS,  # noqa: E402
+                           FirePredictor, validate_image)
+
 
 # --------------------------------------------------------------------------- #
 # Configuration (all overridable through the environment)
 # --------------------------------------------------------------------------- #
+def _env_number(name: str, default, cast, minimum=None, maximum=None):
+    """Read a numeric environment variable, failing with a usable message.
+
+    ``float(os.environ[...])`` kills the worker at import with a bare
+    ``could not convert string to float: 'half'`` and no hint of which setting
+    is at fault - which in a container means an endless CrashLoopBackOff.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == '':
+        return default
+    try:
+        value = cast(raw.strip())
+    except ValueError:
+        raise ValueError(
+            f'{name}={raw!r} is not a valid {cast.__name__}') from None
+    if minimum is not None and value < minimum:
+        raise ValueError(f'{name}={raw!r} must be >= {minimum}')
+    if maximum is not None and value > maximum:
+        raise ValueError(f'{name}={raw!r} must be <= {maximum}')
+    return value
+
+
 MODEL_PATH = os.environ.get('MODEL_PATH', '/models/fire_detection_model.pt')
 DEVICE = os.environ.get('DEVICE', 'auto')
-SCORE_THRESHOLD = float(os.environ.get('SCORE_THRESHOLD', '0.5'))
-MASK_THRESHOLD = float(os.environ.get('MASK_THRESHOLD', '0.5'))
-MAX_CONTENT_LENGTH_MB = float(os.environ.get('MAX_CONTENT_LENGTH_MB', '16'))
-MAX_BATCH_SIZE = int(os.environ.get('MAX_BATCH_SIZE', '16'))
+if DEVICE not in {'auto', 'cpu', 'cuda'}:
+    raise ValueError(f"DEVICE={DEVICE!r} must be one of 'auto', 'cpu', 'cuda'")
+SCORE_THRESHOLD = _env_number('SCORE_THRESHOLD', 0.5, float, 0.0, 1.0)
+MASK_THRESHOLD = _env_number('MASK_THRESHOLD', 0.5, float, 0.0, 1.0)
+MAX_CONTENT_LENGTH_MB = _env_number('MAX_CONTENT_LENGTH_MB', 16.0, float, 0.001)
+MAX_BATCH_SIZE = _env_number('MAX_BATCH_SIZE', 16, int, 1)
+MAX_IMAGE_PIXELS = _env_number('MAX_IMAGE_PIXELS', DEFAULT_MAX_IMAGE_PIXELS, int, 1)
+# Seconds to wait before retrying a failed model load. Without it every request
+# would re-run the (multi-second) build+load while the checkpoint is missing.
+MODEL_LOAD_RETRY_SECONDS = _env_number('MODEL_LOAD_RETRY_SECONDS', 30.0, float, 0.0)
 MAX_CONTENT_LENGTH = int(MAX_CONTENT_LENGTH_MB * 1024 * 1024)
 
 ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'tif', 'tiff', 'bmp'}
@@ -71,6 +100,7 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 _predictor: Optional[FirePredictor] = None
 _load_error: Optional[str] = None
 _load_lock = threading.Lock()
+_next_load_attempt = 0.0
 
 # --------------------------------------------------------------------------- #
 # Metrics
@@ -98,32 +128,39 @@ def get_predictor() -> Optional[FirePredictor]:
     Returns ``None`` when the checkpoint is missing or unreadable; the error is
     kept in ``_load_error`` and surfaced by /health and /ready.
     """
-    global _predictor, _load_error
+    global _predictor, _load_error, _next_load_attempt
     if _predictor is not None:
         return _predictor
 
     with _load_lock:
         if _predictor is not None:
             return _predictor
+        if time.monotonic() < _next_load_attempt:
+            # Still inside the back-off window from the last failure.
+            return None
         try:
             app.logger.info('Loading model from %s', MODEL_PATH)
             _predictor = FirePredictor.from_checkpoint(
                 MODEL_PATH, device=DEVICE,
                 score_threshold=SCORE_THRESHOLD,
                 mask_threshold=MASK_THRESHOLD)
+            _predictor.max_image_pixels = MAX_IMAGE_PIXELS
             _load_error = None
+            _next_load_attempt = 0.0
             app.logger.info('Model loaded (classes: %s)', _predictor.class_names)
         except Exception as exc:
             _load_error = f'{type(exc).__name__}: {exc}'
+            _next_load_attempt = time.monotonic() + MODEL_LOAD_RETRY_SECONDS
             app.logger.error('Failed to load model from %s: %s', MODEL_PATH, _load_error)
         return _predictor
 
 
 def set_predictor(predictor: Optional[FirePredictor]) -> None:
     """Inject a predictor directly. Used by tests and by warm-up code."""
-    global _predictor, _load_error
+    global _predictor, _load_error, _next_load_attempt
     _predictor = predictor
     _load_error = None if predictor is not None else _load_error
+    _next_load_attempt = 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -136,13 +173,18 @@ def allowed_file(filename: str) -> bool:
 
 
 def decode_image(raw: bytes) -> np.ndarray:
-    """Decode uploaded bytes into an RGB uint8 array without touching disk."""
+    """Decode uploaded bytes into an RGB uint8 array without touching disk.
+
+    MAX_CONTENT_LENGTH bounds the *compressed* upload; a few-kilobyte PNG can
+    still decode to gigabytes, so the decoded size is checked separately.
+    """
     if not raw:
         raise ValueError('Empty file')
     buffer = np.frombuffer(raw, dtype=np.uint8)
     image = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError('Could not decode image; the file may be corrupt')
+    validate_image(image, MAX_IMAGE_PIXELS)
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
@@ -240,6 +282,7 @@ def model_info():
         'supported_formats': sorted(ALLOWED_EXTENSIONS),
         'max_file_size_mb': MAX_CONTENT_LENGTH_MB,
         'max_batch_size': MAX_BATCH_SIZE,
+        'max_image_pixels': MAX_IMAGE_PIXELS,
         'status': 'loaded',
     }), 200
 
@@ -279,12 +322,17 @@ def predict():
     except ValueError as exc:
         _record(errors_total=1)
         return jsonify({'error': str(exc), 'status': 'error'}), 400
-    except Exception as exc:
+    except MemoryError:
         _record(errors_total=1)
-        app.logger.error('Prediction failed: %s', exc)
-        traceback.print_exc()
-        return jsonify({'error': 'Prediction failed', 'detail': str(exc),
-                        'status': 'error'}), 500
+        app.logger.error('Ran out of memory decoding or scoring an upload')
+        return jsonify({'error': 'Image too large to process',
+                        'status': 'error'}), 413
+    except Exception:
+        _record(errors_total=1)
+        # Full traceback to the server log; a generic message to the caller so
+        # file paths and library versions do not leak.
+        app.logger.exception('Prediction failed')
+        return jsonify({'error': 'Prediction failed', 'status': 'error'}), 500
 
 
 @app.route('/batch_predict', methods=['POST'])
@@ -323,9 +371,22 @@ def batch_predict():
         try:
             results.append(_run_single(predictor, uploaded.read(), filename, overlay))
             succeeded += 1
-        except Exception as exc:
-            app.logger.warning('Batch item %s failed: %s', filename, exc)
-            results.append({'filename': filename, 'error': str(exc), 'status': 'error'})
+        except ValueError as exc:
+            # Bad input for this one file; the rest of the batch continues.
+            app.logger.info('Batch item %s rejected: %s', filename, exc)
+            results.append({'filename': filename, 'error': str(exc),
+                            'status': 'error'})
+        except MemoryError:
+            app.logger.error('Batch item %s exhausted memory', filename)
+            results.append({'filename': filename,
+                            'error': 'Image too large to process',
+                            'status': 'error'})
+        except Exception:
+            # Unexpected: log the traceback server-side, tell the client nothing
+            # about our internals.
+            app.logger.exception('Batch item %s failed', filename)
+            results.append({'filename': filename, 'error': 'Prediction failed',
+                            'status': 'error'})
 
     failed = len(results) - succeeded
     if failed:
