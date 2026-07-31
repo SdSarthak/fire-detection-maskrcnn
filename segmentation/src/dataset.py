@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -41,26 +42,42 @@ def _shape_to_polygon(shape: Dict) -> Optional[np.ndarray]:
     if 'all_points_x' in shape and 'all_points_y' in shape:
         xs = shape['all_points_x']
         ys = shape['all_points_y']
+        if not isinstance(xs, (list, tuple)) or not isinstance(ys, (list, tuple)):
+            return None
         if len(xs) != len(ys) or len(xs) < 3:
             return None
-        return np.stack([np.asarray(xs, dtype=np.float64),
-                         np.asarray(ys, dtype=np.float64)], axis=1)
+        try:
+            points = np.stack([np.asarray(xs, dtype=np.float64),
+                               np.asarray(ys, dtype=np.float64)], axis=1)
+        except (TypeError, ValueError):
+            return None  # non-numeric coordinates in the export
+        if not np.isfinite(points).all():
+            return None
+        return points
 
     if name == 'rect' and {'x', 'y', 'width', 'height'} <= set(shape):
-        x, y = float(shape['x']), float(shape['y'])
-        w, h = float(shape['width']), float(shape['height'])
-        if w <= 0 or h <= 0:
+        try:
+            x, y = float(shape['x']), float(shape['y'])
+            w, h = float(shape['width']), float(shape['height'])
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(v) for v in (x, y, w, h)) or w <= 0 or h <= 0:
             return None
         return np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]],
                         dtype=np.float64)
 
     if name in {'circle', 'ellipse'} and {'cx', 'cy'} <= set(shape):
-        cx, cy = float(shape['cx']), float(shape['cy'])
-        if name == 'circle':
-            rx = ry = float(shape.get('r', 0.0))
-        else:
-            rx = float(shape.get('rx', 0.0))
-            ry = float(shape.get('ry', 0.0))
+        try:
+            cx, cy = float(shape['cx']), float(shape['cy'])
+            if name == 'circle':
+                rx = ry = float(shape.get('r', 0.0))
+            else:
+                rx = float(shape.get('rx', 0.0))
+                ry = float(shape.get('ry', 0.0))
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(v) for v in (cx, cy, rx, ry)):
+            return None
         if rx <= 0 or ry <= 0:
             return None
         theta = np.linspace(0.0, 2.0 * math.pi, num=32, endpoint=False)
@@ -107,14 +124,23 @@ def parse_via_annotations(via_data: Dict,
     Returns:
         Mapping of image filename to a list of ``(N, 2)`` float polygons.
     """
-    records = via_data.get(VIA_METADATA_KEY, via_data) if isinstance(via_data, dict) else {}
+    if not isinstance(via_data, dict):
+        raise TypeError(
+            'VIA annotations must decode to a JSON object mapping image keys to '
+            f'records; got {type(via_data).__name__}')
+
+    records = via_data.get(VIA_METADATA_KEY, via_data)
+    if not isinstance(records, dict):
+        raise TypeError(
+            f'{VIA_METADATA_KEY!r} must be a JSON object, got '
+            f'{type(records).__name__}')
 
     parsed: Dict[str, List[np.ndarray]] = {}
     for key, image_data in records.items():
         if not isinstance(image_data, dict):
             continue
         filename = image_data.get('filename')
-        if not filename:
+        if not filename or not isinstance(filename, str):
             # VIA keys look like "fire_1.jpg12345"; fall back to the key itself.
             filename = str(key)
 
@@ -140,23 +166,101 @@ def load_via_annotations(path,
     json_path = Path(path)
     if not json_path.exists():
         raise FileNotFoundError(f'Annotation file not found: {json_path}')
-    with open(json_path, 'r', encoding='utf-8') as handle:
-        return parse_via_annotations(json.load(handle), class_filter=class_filter)
+    try:
+        with open(json_path, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f'{json_path} is not valid JSON (line {exc.lineno}, column '
+            f'{exc.colno}: {exc.msg}). Re-export the project from the VGG Image '
+            'Annotator.') from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f'{json_path} is not UTF-8 text; VIA exports must be saved as '
+            'UTF-8 JSON.') from exc
+    return parse_via_annotations(data, class_filter=class_filter)
 
 
 # --------------------------------------------------------------------------- #
 # Mask helpers
 # --------------------------------------------------------------------------- #
+def _clip_polygon_to_rect(points: np.ndarray, width: float,
+                          height: float) -> List[Tuple[float, float]]:
+    """Sutherland-Hodgman clip of a polygon against ``[0, width] x [0, height]``.
+
+    Snapping out-of-frame vertices onto the border (the naive alternative)
+    changes the slope of every edge that crosses it and therefore changes the
+    rasterised area. Clipping keeps the visible part of the polygon exact.
+    """
+    def inside(point: Tuple[float, float], edge: int) -> bool:
+        x, y = point
+        if edge == 0:
+            return x >= 0.0
+        if edge == 1:
+            return x <= width
+        if edge == 2:
+            return y >= 0.0
+        return y <= height
+
+    def intersect(start: Tuple[float, float], end: Tuple[float, float],
+                  edge: int) -> Tuple[float, float]:
+        (x1, y1), (x2, y2) = start, end
+        if edge in (0, 1):
+            boundary = 0.0 if edge == 0 else float(width)
+            if x2 == x1:
+                return (boundary, y1)
+            t = (boundary - x1) / (x2 - x1)
+            return (boundary, y1 + t * (y2 - y1))
+        boundary = 0.0 if edge == 2 else float(height)
+        if y2 == y1:
+            return (x1, boundary)
+        t = (boundary - y1) / (y2 - y1)
+        return (x1 + t * (x2 - x1), boundary)
+
+    output: List[Tuple[float, float]] = [(float(x), float(y)) for x, y in points]
+    for edge in range(4):
+        if not output:
+            return []
+        current, output = output, []
+        previous = current[-1]
+        for point in current:
+            if inside(point, edge):
+                if not inside(previous, edge):
+                    output.append(intersect(previous, point, edge))
+                output.append(point)
+            elif inside(previous, edge):
+                output.append(intersect(previous, point, edge))
+            previous = point
+    return output
+
+
 def polygon_to_mask(polygon: np.ndarray, height: int, width: int) -> np.ndarray:
-    """Rasterise one polygon into a ``(height, width)`` uint8 binary mask."""
+    """Rasterise one polygon into a ``(height, width)`` uint8 binary mask.
+
+    Polygons that extend beyond the image are clipped geometrically, not by
+    snapping their vertices to the border. Malformed polygons (wrong rank,
+    fewer than three points, NaN/inf coordinates) rasterise to an empty mask
+    rather than raising, so one bad annotation cannot abort a training run.
+    """
+    if height <= 0 or width <= 0:
+        raise ValueError(f'Mask size must be positive; got {height}x{width}')
+
     mask = np.zeros((height, width), dtype=np.uint8)
     points = np.asarray(polygon, dtype=np.float64)
-    if points.ndim != 2 or points.shape[0] < 3:
+    if points.ndim != 2 or points.shape[1] != 2 or points.shape[0] < 3:
         return mask
-    points = np.round(points).astype(np.int32)
-    np.clip(points[:, 0], 0, width - 1, out=points[:, 0])
-    np.clip(points[:, 1], 0, height - 1, out=points[:, 1])
-    cv2.fillPoly(mask, [points], 1)
+    if not np.isfinite(points).all():
+        return mask
+
+    clipped = _clip_polygon_to_rect(points, float(width), float(height))
+    if len(clipped) < 3:
+        return mask
+
+    pixels = np.round(np.asarray(clipped, dtype=np.float64)).astype(np.int32)
+    # Rounding can land exactly on width/height; pull those back into range.
+    np.clip(pixels[:, 0], 0, width - 1, out=pixels[:, 0])
+    np.clip(pixels[:, 1], 0, height - 1, out=pixels[:, 1])
+    cv2.fillPoly(mask, [pixels], 1)
     return mask
 
 
@@ -213,16 +317,45 @@ def load_image(image_path) -> np.ndarray:
 
 
 def image_to_tensor(image: np.ndarray) -> torch.Tensor:
-    """Convert an HWC uint8 RGB array into a CHW float tensor in [0, 1]."""
+    """Convert an HW / HWC image into a 3-channel CHW float tensor in [0, 1].
+
+    Integer images are divided by the maximum of their dtype rather than by
+    their observed maximum: keying off ``array.max()`` leaves a very dark
+    uint8 frame (peak value 0 or 1) unscaled, which silently feeds the
+    detector pixels that are 255x too bright.
+    """
     array = np.asarray(image)
+    if array.size == 0:
+        raise ValueError('Cannot convert an empty image to a tensor')
     if array.ndim == 2:
-        array = np.stack([array] * 3, axis=-1)
-    if array.shape[2] == 4:
+        array = array[:, :, np.newaxis]
+    if array.ndim != 3:
+        raise ValueError(
+            f'Expected an HW or HWC image, got an array of shape {array.shape}')
+
+    channels = array.shape[2]
+    if channels == 1:
+        array = np.repeat(array, 3, axis=2)
+    elif channels == 4:
         array = array[:, :, :3]
-    if array.dtype != np.float32:
+    elif channels != 3:
+        raise ValueError(
+            f'Unsupported channel count {channels}; expected 1 (grey), 3 (RGB) '
+            'or 4 (RGBA)')
+
+    if np.issubdtype(array.dtype, np.integer):
+        scale = float(np.iinfo(array.dtype).max) or 1.0
+        array = array.astype(np.float32) / scale
+    elif array.dtype == bool:
         array = array.astype(np.float32)
-    if array.max() > 1.0:
-        array = array / 255.0
+    else:
+        array = array.astype(np.float32)
+        if not np.isfinite(array).all():
+            raise ValueError('Image contains NaN or infinite pixel values')
+        if float(array.max()) > 1.0:
+            array = array / 255.0
+
+    np.clip(array, 0.0, 1.0, out=array)
     return torch.from_numpy(np.ascontiguousarray(array.transpose(2, 0, 1)))
 
 
@@ -258,6 +391,17 @@ class FireSegmentationDataset(Dataset):
         self.label = int(label)
         self.min_instance_area = int(min_instance_area)
 
+        if not 0.0 <= self.horizontal_flip_prob <= 1.0:
+            raise ValueError(
+                f'horizontal_flip_prob must be in [0, 1]; got '
+                f'{self.horizontal_flip_prob}')
+        if self.label < 1:
+            raise ValueError(
+                f'label must be >= 1 (0 is reserved for background); got {self.label}')
+        if self.min_instance_area < 0:
+            raise ValueError(
+                f'min_instance_area must be >= 0; got {self.min_instance_area}')
+
         if annotations is None:
             self.annotations: Dict[str, List[np.ndarray]] = {}
         elif isinstance(annotations, dict):
@@ -270,6 +414,19 @@ class FireSegmentationDataset(Dataset):
             self.image_paths = [p for p in all_images if self.annotations.get(p.name)]
         else:
             self.image_paths = all_images
+
+        # Annotations are keyed by basename, so two files with the same name in
+        # different sub-directories would silently share one set of polygons.
+        seen: Dict[str, Path] = {}
+        collisions = sorted({p.name for p in self.image_paths
+                             if p.name in seen or seen.setdefault(p.name, p) is None})
+        if collisions:
+            warnings.warn(
+                f'{len(collisions)} duplicate image basename(s) under '
+                f'{self.images_dir} ({", ".join(collisions[:5])}); annotations are '
+                'looked up by basename so these images will share labels. '
+                'Rename them or flatten the directory.',
+                RuntimeWarning, stacklevel=2)
 
     def __len__(self) -> int:
         return len(self.image_paths)

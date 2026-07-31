@@ -150,3 +150,96 @@ def test_polygons_to_masks_stacks_instances():
 
     assert masks.shape == (2, 10, 10)
     assert not np.logical_and(masks[0], masks[1]).any()
+
+
+# --------------------------------------------------------------------------- #
+# Out-of-frame polygons and malformed annotations (Pass 2)
+# --------------------------------------------------------------------------- #
+def test_polygon_extending_past_the_frame_is_clipped_geometrically():
+    """Snapping vertices to the border would shrink the visible area.
+
+    The triangle below has one vertex far to the left of the image. Clamping
+    that vertex onto x=0 changes the slope of both edges that leave the frame
+    and loses roughly 40% of the pixels that are genuinely inside it.
+    """
+    triangle = np.array([[-30.0, 10.0], [10.0, 0.0], [10.0, 20.0]])
+
+    mask = polygon_to_mask(triangle, height=20, width=20)
+
+    snapped = np.clip(triangle, [0, 0], [19, 19])
+    naive = polygon_to_mask(snapped, height=20, width=20)
+
+    assert mask.sum() > naive.sum()
+    assert mask.sum() == pytest.approx(196, abs=8)
+    # At x=0 the true triangle spans y in [2.5, 17.5]; the snapped one is a
+    # single point there, because its apex was dragged onto the border.
+    assert mask[:, 0].sum() == pytest.approx(15, abs=2)
+    assert naive[:, 0].sum() <= 1
+
+
+def test_polygon_entirely_outside_the_frame_rasterises_empty():
+    outside = np.array([[-50.0, -50.0], [-40.0, -50.0], [-40.0, -40.0]])
+    assert polygon_to_mask(outside, height=20, width=20).sum() == 0
+
+
+def test_polygon_covering_the_whole_frame_fills_it():
+    cover = np.array([[-5.0, -5.0], [25.0, -5.0], [25.0, 25.0], [-5.0, 25.0]])
+    assert polygon_to_mask(cover, height=20, width=20).all()
+
+
+def test_polygon_with_non_finite_coordinates_is_dropped_not_raised():
+    broken = np.array([[0.0, 0.0], [np.nan, 5.0], [5.0, 5.0]])
+    assert polygon_to_mask(broken, height=10, width=10).sum() == 0
+
+    infinite = np.array([[0.0, 0.0], [np.inf, 5.0], [5.0, 5.0]])
+    assert polygon_to_mask(infinite, height=10, width=10).sum() == 0
+
+
+def test_polygon_to_mask_rejects_non_positive_canvas():
+    square = np.array([[0.0, 0.0], [4.0, 0.0], [4.0, 4.0]])
+    with pytest.raises(ValueError, match='positive'):
+        polygon_to_mask(square, height=0, width=10)
+
+
+def test_parse_rejects_non_object_json():
+    with pytest.raises(TypeError, match='JSON object'):
+        parse_via_annotations([{'filename': 'a.jpg'}])
+
+
+def test_parse_rejects_non_object_metadata_wrapper():
+    with pytest.raises(TypeError, match=VIA_METADATA_KEY):
+        parse_via_annotations({VIA_METADATA_KEY: ['not', 'a', 'dict']})
+
+
+def test_non_numeric_polygon_points_are_skipped_not_fatal():
+    data = via_project({'fire.jpg': [{'name': 'polygon',
+                                      'all_points_x': ['a', 'b', 'c'],
+                                      'all_points_y': [1, 2, 3]}]})
+    assert parse_via_annotations(data) == {'fire.jpg': []}
+
+
+def test_non_numeric_rect_attributes_are_skipped():
+    data = via_project({'fire.jpg': [{'name': 'rect', 'x': 'left', 'y': 0,
+                                      'width': 5, 'height': 5}]})
+    assert parse_via_annotations(data) == {'fire.jpg': []}
+
+
+def test_load_via_annotations_reports_malformed_json_with_position(tmp_path):
+    path = tmp_path / 'broken.json'
+    path.write_text('{"a": ', encoding='utf-8')
+
+    with pytest.raises(ValueError) as excinfo:
+        load_via_annotations(path)
+
+    message = str(excinfo.value)
+    assert 'broken.json' in message and 'not valid JSON' in message
+
+
+def test_load_via_annotations_handles_unicode_filenames(tmp_path):
+    path = tmp_path / 'unicode.json'
+    payload = via_project({'\u706b\u707d_\u00e9t\u00e9.jpg': [rectangle_polygon(1, 1, 5, 5)]})
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+
+    parsed = load_via_annotations(path)
+
+    assert list(parsed) == ['\u706b\u707d_\u00e9t\u00e9.jpg']

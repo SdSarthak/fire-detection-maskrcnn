@@ -131,3 +131,95 @@ def test_collate_fn_keeps_variable_sized_images_apart(dataset_dir):
     assert len(images) == 2 and len(targets) == 2
     assert isinstance(images, tuple)
     assert all(isinstance(image, torch.Tensor) for image in images)
+
+
+# --------------------------------------------------------------------------- #
+# image_to_tensor edge cases (Pass 2)
+# --------------------------------------------------------------------------- #
+def test_very_dark_uint8_image_is_still_scaled_by_255():
+    """Keying normalisation off ``array.max()`` breaks on near-black frames.
+
+    A night-time frame whose brightest pixel is 1 must become 1/255, not 1.0 -
+    otherwise the detector sees a pixel 255x brighter than it really is.
+    """
+    dark = np.zeros((4, 4, 3), dtype=np.uint8)
+    dark[0, 0] = 1
+
+    tensor = image_to_tensor(dark)
+
+    assert float(tensor.max()) == pytest.approx(1.0 / 255.0)
+
+
+def test_all_black_uint8_image_stays_zero():
+    tensor = image_to_tensor(np.zeros((4, 4, 3), dtype=np.uint8))
+    assert float(tensor.max()) == 0.0
+    assert tensor.shape == (3, 4, 4)
+
+
+def test_uint8_white_maps_to_one():
+    tensor = image_to_tensor(np.full((2, 2, 3), 255, dtype=np.uint8))
+    assert float(tensor.min()) == pytest.approx(1.0)
+
+
+def test_single_channel_hwc_image_is_expanded_to_three():
+    tensor = image_to_tensor(np.zeros((5, 7, 1), dtype=np.uint8))
+    assert tensor.shape == (3, 5, 7)
+
+
+def test_empty_image_raises_a_clear_error():
+    with pytest.raises(ValueError, match='empty image'):
+        image_to_tensor(np.zeros((0, 0, 3), dtype=np.uint8))
+
+
+def test_unsupported_channel_count_raises():
+    with pytest.raises(ValueError, match='channel count'):
+        image_to_tensor(np.zeros((4, 4, 5), dtype=np.uint8))
+
+
+def test_five_dimensional_input_raises():
+    with pytest.raises(ValueError, match='HW or HWC'):
+        image_to_tensor(np.zeros((2, 4, 4, 3), dtype=np.uint8))
+
+
+def test_float_image_with_nan_raises():
+    array = np.zeros((3, 3, 3), dtype=np.float32)
+    array[0, 0, 0] = np.nan
+    with pytest.raises(ValueError, match='NaN'):
+        image_to_tensor(array)
+
+
+def test_float_image_already_in_unit_range_is_left_alone():
+    array = np.full((3, 3, 3), 0.5, dtype=np.float32)
+    assert float(image_to_tensor(array).max()) == pytest.approx(0.5)
+
+
+def test_out_of_range_float_pixels_are_clipped_into_unit_range():
+    array = np.full((3, 3, 3), -2.0, dtype=np.float32)
+    tensor = image_to_tensor(array)
+    assert float(tensor.min()) == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Dataset argument validation (Pass 2)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize('prob', [-0.1, 1.5])
+def test_dataset_rejects_out_of_range_flip_probability(dataset_dir, prob):
+    with pytest.raises(ValueError, match='horizontal_flip_prob'):
+        FireSegmentationDataset(dataset_dir / 'train', horizontal_flip_prob=prob,
+                                require_annotations=False)
+
+
+def test_dataset_rejects_background_label(dataset_dir):
+    with pytest.raises(ValueError, match='reserved for background'):
+        FireSegmentationDataset(dataset_dir / 'train', label=0,
+                                require_annotations=False)
+
+
+def test_dataset_warns_about_duplicate_basenames(dataset_dir):
+    nested = dataset_dir / 'train' / 'nested'
+    nested.mkdir()
+    cv2.imwrite(str(nested / 'fire_train_1.jpg'),
+                np.zeros((48, 64, 3), dtype=np.uint8))
+
+    with pytest.warns(RuntimeWarning, match='duplicate image basename'):
+        FireSegmentationDataset(dataset_dir / 'train', require_annotations=False)
