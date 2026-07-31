@@ -309,10 +309,26 @@ def list_images(directory) -> List[Path]:
 
 
 def load_image(image_path) -> np.ndarray:
-    """Load an image from disk as an RGB uint8 array."""
-    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    """Load an image from disk as an RGB uint8 array.
+
+    The file is read with Python and decoded from memory rather than handed to
+    ``cv2.imread``: OpenCV passes the path through the C locale, so non-ASCII
+    filenames are mangled on Windows.
+    """
+    path = Path(image_path)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        raise FileNotFoundError(f'Image file not found: {path}') from None
+    except OSError as exc:
+        raise ValueError(f'Could not read {path}: {exc}') from exc
+
+    if not raw:
+        raise ValueError(f'Image file is empty: {path}')
+    image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None:
-        raise ValueError(f'Failed to load image: {image_path}')
+        raise ValueError(
+            f'Failed to decode image: {path} (unsupported format or corrupt file)')
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 

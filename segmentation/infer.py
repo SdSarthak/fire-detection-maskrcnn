@@ -40,7 +40,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'])
     parser.add_argument('--no-overlay', action='store_true',
                         help='Skip writing the annotated images')
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    for flag, value in (('--score-threshold', args.score_threshold),
+                        ('--mask-threshold', args.mask_threshold)):
+        if value is not None and not 0.0 <= value <= 1.0:
+            parser.error(f'{flag} must be in [0, 1]; got {value}')
+    return args
 
 
 def collect_inputs(target: Path):
@@ -50,6 +56,27 @@ def collect_inputs(target: Path):
     if target.is_file():
         return [target]
     raise SystemExit(f'Input not found: {target}')
+
+
+def overlay_paths(images, output_dir: Path) -> dict:
+    """Map each input image to a unique overlay path.
+
+    ``prediction_<stem>.png`` collides for ``a.jpg`` and ``a.png``, and for the
+    same basename in two sub-directories - the later result used to silently
+    overwrite the earlier one.
+    """
+    destinations = {}
+    used = set()
+    for image_path in images:
+        stem = image_path.stem
+        candidate = f'prediction_{stem}.png'
+        suffix = 1
+        while candidate.lower() in used:
+            suffix += 1
+            candidate = f'prediction_{stem}_{suffix}.png'
+        used.add(candidate.lower())
+        destinations[image_path] = output_dir / candidate
+    return destinations
 
 
 def main(argv=None) -> int:
@@ -79,12 +106,17 @@ def main(argv=None) -> int:
         mask_threshold=args.mask_threshold)
 
     output_dir = Path(args.output_dir)
+    destinations = overlay_paths(images, output_dir)
     results = []
+    failures = 0
 
     for index, image_path in enumerate(images, start=1):
         try:
             result, image = predictor.predict_file(image_path)
-        except Exception as exc:  # a single unreadable file must not stop the run
+        except (ValueError, OSError) as exc:
+            # A single unreadable, corrupt or oversized file must not stop the
+            # run; anything else is a real bug and should propagate.
+            failures += 1
             print(f'  [{index}/{len(images)}] {image_path.name}: failed - {exc}')
             results.append({'filename': image_path.name, 'error': str(exc)})
             continue
@@ -96,7 +128,7 @@ def main(argv=None) -> int:
               f'area {result["fire_area_ratio"] * 100:.2f}%)')
 
         if not args.no_overlay:
-            overlay_path = output_dir / f'prediction_{image_path.stem}.png'
+            overlay_path = destinations[image_path]
             predictor.save_overlay(image, result, overlay_path)
             result['overlay_path'] = str(overlay_path)
 
@@ -109,10 +141,13 @@ def main(argv=None) -> int:
     fires = sum(1 for r in results if r.get('is_fire'))
     print('\n' + '=' * 60)
     print(f'Done: fire detected in {fires}/{len(results)} image(s)')
+    if failures:
+        print(f'Failed to process {failures} image(s); see the JSON for details')
     print(f'Results: {json_path}')
     if not args.no_overlay:
         print(f'Overlays: {output_dir}')
-    return 0
+    # Non-zero when nothing could be processed at all, so scripts can tell.
+    return 1 if failures == len(images) else 0
 
 
 if __name__ == '__main__':

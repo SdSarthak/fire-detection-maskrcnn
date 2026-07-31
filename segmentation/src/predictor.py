@@ -267,10 +267,22 @@ class FirePredictor:
 
     def save_overlay(self, image: np.ndarray, result: Dict[str, Any],
                      output_path) -> Path:
-        """Render an overlay and write it to disk as an image file."""
+        """Render an overlay and write it to disk as an image file.
+
+        Encoded in memory and written with Python rather than via
+        ``cv2.imwrite``: on Windows OpenCV encodes the path with the ANSI code
+        page, so a non-ASCII output path silently produces a file under a
+        mangled name *and still returns success*.
+        """
         destination = Path(output_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         overlay = self.render_overlay(image, result)
-        if not cv2.imwrite(str(destination), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)):
-            raise IOError(f'Failed to write overlay image: {destination}')
+
+        suffix = destination.suffix or '.png'
+        success, encoded = cv2.imencode(
+            suffix, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        if not success:
+            raise IOError(
+                f'Could not encode the overlay as {suffix!r}: {destination}')
+        destination.write_bytes(encoded.tobytes())
         return destination
