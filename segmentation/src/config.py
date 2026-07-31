@@ -7,7 +7,9 @@ Every field can be overridden with an environment variable named
 """
 from __future__ import annotations
 
+import math
 import os
+import warnings
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -27,6 +29,9 @@ CLASS_NAMES: Tuple[str, ...] = ('__background__', 'fire')
 
 ENV_PREFIX = 'FIRE_'
 
+# FIRE_* variables that are read elsewhere and are not configuration fields.
+_ENV_ALLOWLIST = frozenset({'FIRE_TRUST_CHECKPOINT'})
+
 
 def ensure_directories() -> None:
     """Create the project data/weights/output directories if they are missing."""
@@ -35,14 +40,40 @@ def ensure_directories() -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
 
-def _coerce(value: str, target_type: Any) -> Any:
-    """Convert an environment string to the type of the matching config field."""
+_TRUTHY = {'1', 'true', 'yes', 'on'}
+_FALSY = {'0', 'false', 'no', 'off'}
+
+
+def _coerce(value: str, target_type: Any, variable: str = '') -> Any:
+    """Convert an environment string to the type of the matching config field.
+
+    Raises a ``ValueError`` naming the offending variable: the bare
+    ``int('fast')`` traceback gives no clue which ``FIRE_*`` setting is wrong.
+    """
+    where = f'{variable}=' if variable else ''
+    text = value.strip()
     if target_type is bool:
-        return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+        lowered = text.lower()
+        if lowered in _TRUTHY:
+            return True
+        if lowered in _FALSY:
+            return False
+        raise ValueError(
+            f'{where}{value!r} is not a boolean; use one of '
+            f'{sorted(_TRUTHY | _FALSY)}')
     if target_type is int:
-        return int(value)
+        try:
+            return int(text)
+        except ValueError:
+            raise ValueError(f'{where}{value!r} is not an integer') from None
     if target_type is float:
-        return float(value)
+        try:
+            parsed = float(text)
+        except ValueError:
+            raise ValueError(f'{where}{value!r} is not a number') from None
+        if not math.isfinite(parsed):
+            raise ValueError(f'{where}{value!r} must be a finite number')
+        return parsed
     return value
 
 
@@ -115,6 +146,18 @@ class FireDetectionConfig:
     MODEL_PATH: str = str(WEIGHTS_DIR / 'fire_detection_model.pt')
     CLASS_NAMES: Tuple[str, ...] = CLASS_NAMES
 
+    # Fields that must be strictly positive, and fields that are probabilities.
+    _POSITIVE_FIELDS = ('IMAGE_MIN_DIM', 'IMAGE_MAX_DIM', 'NUM_CLASSES',
+                        'LEARNING_RATE', 'LR_STEP_SIZE', 'TRAIN_EPOCHS',
+                        'BATCH_SIZE', 'POOL_SIZE', 'MASK_POOL_SIZE',
+                        'MASK_HIDDEN_LAYER', 'DETECTION_MAX_INSTANCES',
+                        'RPN_TRAIN_ANCHORS_PER_IMAGE')
+    _UNIT_INTERVAL_FIELDS = ('LEARNING_MOMENTUM', 'HORIZONTAL_FLIP_PROB',
+                             'RPN_NMS_THRESHOLD', 'DETECTION_MIN_CONFIDENCE',
+                             'DETECTION_NMS_THRESHOLD', 'MASK_BINARY_THRESHOLD',
+                             'LR_GAMMA')
+    _NON_NEGATIVE_FIELDS = ('WEIGHT_DECAY', 'NUM_WORKERS', 'GRAD_CLIP_NORM', 'SEED')
+
     def __post_init__(self) -> None:
         # Tuples survive round-tripping through JSON/dict as lists; normalise.
         self.RPN_ANCHOR_SCALES = tuple(int(s) for s in self.RPN_ANCHOR_SCALES)
@@ -132,6 +175,37 @@ class FireDetectionConfig:
                 "PRETRAINED_WEIGHTS must be one of 'coco', 'imagenet', 'none'; "
                 f'got {self.PRETRAINED_WEIGHTS!r}'
             )
+        if self.DEVICE not in {'auto', 'cpu', 'cuda'}:
+            raise ValueError(
+                f"DEVICE must be one of 'auto', 'cpu', 'cuda'; got {self.DEVICE!r}")
+        if not 0 <= self.TRAINABLE_BACKBONE_LAYERS <= 5:
+            raise ValueError(
+                'TRAINABLE_BACKBONE_LAYERS must be between 0 and 5; got '
+                f'{self.TRAINABLE_BACKBONE_LAYERS}')
+        if not 0.0 < self.EVAL_IOU_THRESHOLD <= 1.0:
+            raise ValueError(
+                f'EVAL_IOU_THRESHOLD must be in (0, 1]; got {self.EVAL_IOU_THRESHOLD}')
+        if not self.RPN_ANCHOR_SCALES or not self.RPN_ANCHOR_RATIOS:
+            raise ValueError('RPN_ANCHOR_SCALES and RPN_ANCHOR_RATIOS cannot be empty')
+        if any(s <= 0 for s in self.RPN_ANCHOR_SCALES):
+            raise ValueError(
+                f'RPN_ANCHOR_SCALES must all be positive; got {self.RPN_ANCHOR_SCALES}')
+        if any(r <= 0 for r in self.RPN_ANCHOR_RATIOS):
+            raise ValueError(
+                f'RPN_ANCHOR_RATIOS must all be positive; got {self.RPN_ANCHOR_RATIOS}')
+
+        for name in self._POSITIVE_FIELDS:
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f'{name} must be a positive number; got {value!r}')
+        for name in self._NON_NEGATIVE_FIELDS:
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f'{name} must be zero or greater; got {value!r}')
+        for name in self._UNIT_INTERVAL_FIELDS:
+            value = getattr(self, name)
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f'{name} must be in [0, 1]; got {value!r}')
 
     @classmethod
     def from_env(cls, **overrides: Any) -> 'FireDetectionConfig':
@@ -143,9 +217,26 @@ class FireDetectionConfig:
                 continue
             if f.type in ('Tuple[int, ...]', 'Tuple[float, ...]'):
                 continue  # sequences are not configured through the environment
-            values[f.name] = _coerce(raw, {'str': str, 'int': int,
-                                           'float': float, 'bool': bool}.get(f.type, str))
+            values[f.name] = _coerce(
+                raw,
+                {'str': str, 'int': int, 'float': float, 'bool': bool}.get(f.type, str),
+                variable=ENV_PREFIX + f.name)
+
+        unknown = sorted(name for name in os.environ
+                         if name.startswith(ENV_PREFIX)
+                         and name[len(ENV_PREFIX):] not in {f.name for f in fields(cls)}
+                         and name not in _ENV_ALLOWLIST)
+        if unknown:
+            warnings.warn(
+                f'Ignoring unrecognised {ENV_PREFIX}* variable(s): '
+                f'{", ".join(unknown)}. Check for typos - these have no effect.',
+                RuntimeWarning, stacklevel=2)
+
         values.update({k: v for k, v in overrides.items() if v is not None})
+        unexpected = sorted(set(values) - {f.name for f in fields(cls)})
+        if unexpected:
+            raise TypeError(
+                f'Unknown configuration field(s): {", ".join(unexpected)}')
         return cls(**values)
 
     @classmethod

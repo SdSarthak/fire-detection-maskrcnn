@@ -86,3 +86,130 @@ def test_display_prints_every_field(capsys):
     output = capsys.readouterr().out
     assert 'NUM_CLASSES: 2' in output
     assert 'LEARNING_RATE' in output
+
+
+# --------------------------------------------------------------------------- #
+# Boundary validation (Pass 2)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize('field,value', [
+    ('TRAIN_EPOCHS', 0),
+    ('BATCH_SIZE', 0),
+    ('BATCH_SIZE', -2),
+    ('LEARNING_RATE', 0.0),
+    ('LEARNING_RATE', -0.1),
+    ('IMAGE_MIN_DIM', 0),
+    ('LR_STEP_SIZE', 0),
+    ('DETECTION_MAX_INSTANCES', 0),
+])
+def test_non_positive_hyperparameters_are_rejected(field, value):
+    with pytest.raises(ValueError, match=field):
+        FireDetectionConfig(**{field: value})
+
+
+@pytest.mark.parametrize('field,value', [
+    ('NUM_WORKERS', -1),
+    ('WEIGHT_DECAY', -0.001),
+    ('GRAD_CLIP_NORM', -1.0),
+])
+def test_negative_non_negative_fields_are_rejected(field, value):
+    with pytest.raises(ValueError, match=field):
+        FireDetectionConfig(**{field: value})
+
+
+@pytest.mark.parametrize('field,value', [
+    ('DETECTION_MIN_CONFIDENCE', 1.5),
+    ('DETECTION_MIN_CONFIDENCE', -0.1),
+    ('MASK_BINARY_THRESHOLD', 2.0),
+    ('HORIZONTAL_FLIP_PROB', 1.2),
+    ('RPN_NMS_THRESHOLD', -0.5),
+    ('LEARNING_MOMENTUM', 1.01),
+])
+def test_probabilities_must_lie_in_the_unit_interval(field, value):
+    with pytest.raises(ValueError, match=field):
+        FireDetectionConfig(**{field: value})
+
+
+def test_nan_learning_rate_is_rejected():
+    with pytest.raises(ValueError, match='LEARNING_RATE'):
+        FireDetectionConfig(LEARNING_RATE=float('nan'))
+
+
+def test_infinite_learning_rate_is_rejected():
+    with pytest.raises(ValueError, match='LEARNING_RATE'):
+        FireDetectionConfig(LEARNING_RATE=float('inf'))
+
+
+def test_eval_iou_threshold_of_zero_is_rejected():
+    with pytest.raises(ValueError, match='EVAL_IOU_THRESHOLD'):
+        FireDetectionConfig(EVAL_IOU_THRESHOLD=0.0)
+
+
+def test_unknown_device_is_rejected():
+    with pytest.raises(ValueError, match='DEVICE'):
+        FireDetectionConfig(DEVICE='tpu')
+
+
+def test_trainable_backbone_layers_are_bounded():
+    with pytest.raises(ValueError, match='TRAINABLE_BACKBONE_LAYERS'):
+        FireDetectionConfig(TRAINABLE_BACKBONE_LAYERS=9)
+
+
+def test_empty_anchor_scales_are_rejected():
+    with pytest.raises(ValueError, match='cannot be empty'):
+        FireDetectionConfig(RPN_ANCHOR_SCALES=())
+
+
+def test_non_positive_anchor_ratios_are_rejected():
+    with pytest.raises(ValueError, match='RPN_ANCHOR_RATIOS'):
+        FireDetectionConfig(RPN_ANCHOR_RATIOS=(1.0, 0.0))
+
+
+# --------------------------------------------------------------------------- #
+# Environment parsing errors name the variable (Pass 2)
+# --------------------------------------------------------------------------- #
+def test_unparseable_int_env_var_names_itself(monkeypatch):
+    monkeypatch.setenv('FIRE_TRAIN_EPOCHS', 'many')
+    with pytest.raises(ValueError, match='FIRE_TRAIN_EPOCHS'):
+        FireDetectionConfig.from_env()
+
+
+def test_unparseable_float_env_var_names_itself(monkeypatch):
+    monkeypatch.setenv('FIRE_LEARNING_RATE', 'fast')
+    with pytest.raises(ValueError, match='FIRE_LEARNING_RATE'):
+        FireDetectionConfig.from_env()
+
+
+def test_non_finite_float_env_var_is_rejected(monkeypatch):
+    monkeypatch.setenv('FIRE_LEARNING_RATE', 'nan')
+    with pytest.raises(ValueError, match='finite'):
+        FireDetectionConfig.from_env()
+
+
+def test_out_of_range_env_var_is_caught_by_post_init(monkeypatch):
+    monkeypatch.setenv('FIRE_DETECTION_MIN_CONFIDENCE', '5')
+    with pytest.raises(ValueError, match='DETECTION_MIN_CONFIDENCE'):
+        FireDetectionConfig.from_env()
+
+
+def test_misspelled_env_var_warns_instead_of_being_silently_ignored(monkeypatch):
+    monkeypatch.setenv('FIRE_LEARNIGN_RATE', '0.01')
+    with pytest.warns(RuntimeWarning, match='FIRE_LEARNIGN_RATE'):
+        FireDetectionConfig.from_env()
+
+
+def test_trust_checkpoint_env_var_is_not_reported_as_a_typo(monkeypatch):
+    import warnings as _warnings
+    monkeypatch.setenv('FIRE_TRUST_CHECKPOINT', '1')
+    with _warnings.catch_warnings():
+        _warnings.simplefilter('error')
+        FireDetectionConfig.from_env()
+
+
+def test_from_env_rejects_unknown_override_keys():
+    with pytest.raises(TypeError, match='NOT_A_FIELD'):
+        FireDetectionConfig.from_env(NOT_A_FIELD=1)
+
+
+def test_inference_config_still_validates():
+    with pytest.raises(ValueError, match='DETECTION_MIN_CONFIDENCE'):
+        InferenceConfig(DETECTION_MIN_CONFIDENCE=-1.0)

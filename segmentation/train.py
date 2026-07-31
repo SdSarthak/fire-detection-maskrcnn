@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import sys
 from pathlib import Path
 
-import torch
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -24,7 +25,7 @@ from src.config import (ANNOTATIONS_DIR, DATA_DIR, OUTPUTS_DIR, WEIGHTS_DIR,
 from src.dataset import FireSegmentationDataset, collate_fn
 from src.model import (build_model, compute_validation_loss, create_optimizer,
                        create_scheduler, evaluate, resolve_device,
-                       save_checkpoint, train_one_epoch)
+                       save_checkpoint, seed_worker, set_seed, train_one_epoch)
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -54,7 +55,23 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument('--history', default=str(OUTPUTS_DIR / 'training_history.json'),
                         help='Where to write the per-epoch metrics')
     parser.add_argument('--seed', type=int, default=None)
-    return parser.parse_args(argv)
+    parser.add_argument('--deterministic', action='store_true',
+                        help='Force deterministic cuDNN kernels (slower, but '
+                             'makes GPU runs reproducible)')
+    args = parser.parse_args(argv)
+
+    # argparse happily accepts --epochs 0 or --lr -1; catch them here so the
+    # failure names the flag instead of surfacing deep inside the optimiser.
+    for flag, value, minimum in (('--epochs', args.epochs, 1),
+                                 ('--batch-size', args.batch_size, 1),
+                                 ('--num-workers', args.num_workers, 0)):
+        if value is not None and value < minimum:
+            parser.error(f'{flag} must be >= {minimum}; got {value}')
+    if args.learning_rate is not None and not args.learning_rate > 0:
+        parser.error(f'--lr must be > 0; got {args.learning_rate}')
+    if args.seed is not None and not 0 <= args.seed < 2 ** 32:
+        parser.error(f'--seed must fit in 32 bits; got {args.seed}')
+    return args
 
 
 def build_config(args: argparse.Namespace) -> FireDetectionConfig:
@@ -71,10 +88,15 @@ def build_config(args: argparse.Namespace) -> FireDetectionConfig:
     )
 
 
-def build_dataloaders(args: argparse.Namespace, config: FireDetectionConfig):
+def build_dataloaders(args: argparse.Namespace, config: FireDetectionConfig,
+                      generator=None):
     """Create the train and validation loaders, tolerating a missing val split."""
     data_dir = Path(args.data_dir)
     annotations_dir = Path(args.annotations_dir)
+    if not data_dir.exists():
+        raise SystemExit(f'Data directory does not exist: {data_dir}')
+    if not annotations_dir.exists():
+        raise SystemExit(f'Annotations directory does not exist: {annotations_dir}')
     class_filter = [c.strip() for c in args.class_filter.split(',') if c.strip()] or None
 
     train_dataset = FireSegmentationDataset(
@@ -93,7 +115,8 @@ def build_dataloaders(args: argparse.Namespace, config: FireDetectionConfig):
 
     train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE,
                               shuffle=True, num_workers=config.NUM_WORKERS,
-                              collate_fn=collate_fn)
+                              collate_fn=collate_fn, generator=generator,
+                              worker_init_fn=seed_worker)
 
     val_annotations = annotations_dir / args.val_annotations
     val_images = data_dir / 'val'
@@ -106,6 +129,14 @@ def build_dataloaders(args: argparse.Namespace, config: FireDetectionConfig):
             horizontal_flip_prob=0.0,
         )
         if len(val_dataset) > 0:
+            leaked = check_split_leakage(train_dataset, val_dataset)
+            if leaked:
+                raise SystemExit(
+                    f'{len(leaked)} image(s) appear in both the train and val '
+                    f'splits ({", ".join(leaked[:5])}'
+                    f'{" ..." if len(leaked) > 5 else ""}). Validation scores '
+                    'would be measured on training data. Remove the duplicates '
+                    'or point --data-dir at a properly split dataset.')
             val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False,
                                     num_workers=config.NUM_WORKERS,
                                     collate_fn=collate_fn)
@@ -113,12 +144,23 @@ def build_dataloaders(args: argparse.Namespace, config: FireDetectionConfig):
     return train_loader, val_loader
 
 
+def check_split_leakage(train_dataset, val_dataset) -> list:
+    """Return image basenames present in both splits.
+
+    Pointing ``data/train`` and ``data/val`` at overlapping folders silently
+    turns every reported val_f1 into a training score.
+    """
+    train_names = {p.name for p in train_dataset.image_paths}
+    val_names = {p.name for p in val_dataset.image_paths}
+    return sorted(train_names & val_names)
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     config = build_config(args)
 
     ensure_directories()
-    torch.manual_seed(config.SEED)
+    generator = set_seed(config.SEED, deterministic=args.deterministic)
 
     print('=' * 60)
     print('Mask R-CNN fire detection - training')
@@ -128,7 +170,7 @@ def main(argv=None) -> int:
     device = resolve_device(config.DEVICE)
     print(f'\nDevice: {device}')
 
-    train_loader, val_loader = build_dataloaders(args, config)
+    train_loader, val_loader = build_dataloaders(args, config, generator=generator)
     print(f'Training images:   {len(train_loader.dataset)}')
     print(f'Validation images: {len(val_loader.dataset) if val_loader else 0}')
     if val_loader is None:
@@ -149,8 +191,15 @@ def main(argv=None) -> int:
     scheduler = create_scheduler(optimizer, config)
 
     checkpoint_path = Path(config.MODEL_PATH)
-    best_score = -1.0
+    # Must be -inf, not -1.0: without a validation split the score is the
+    # negated training loss, so any loss above 1.0 never beats -1.0 and the run
+    # would finish having saved nothing (or, worse, silently leave a stale
+    # checkpoint from an earlier run in place).
+    best_score = float('-inf')
+    best_epoch = -1
     history = []
+    history_path = Path(args.history)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f'\nTraining for {config.TRAIN_EPOCHS} epoch(s)...')
     for epoch in range(config.TRAIN_EPOCHS):
@@ -168,31 +217,44 @@ def main(argv=None) -> int:
             score = -losses['loss']  # no validation data: track training loss
 
         history.append(record)
+        # Flush every epoch: a crash (or a pre-emptible VM) at epoch 27 of 30
+        # used to lose the whole history file.
+        write_history(history_path, history)
+
         summary = ' '.join(f'{k}={v}' for k, v in record.items()
                            if k in {'loss', 'val_loss', 'val_f1', 'val_mean_iou'})
         print(f'  epoch {epoch} done in {losses["seconds"]:.1f}s | {summary}')
 
-        if score > best_score:
+        if math.isfinite(score) and score > best_score:
             best_score = score
+            best_epoch = epoch
             save_checkpoint(model, checkpoint_path, config, epoch=epoch,
                             metrics={k: v for k, v in record.items()
                                      if isinstance(v, (int, float))})
             print(f'  new best checkpoint -> {checkpoint_path}')
 
-    if best_score < 0 and not checkpoint_path.exists():
-        save_checkpoint(model, checkpoint_path, config, epoch=config.TRAIN_EPOCHS - 1)
-
-    history_path = Path(args.history)
-    history_path.parent.mkdir(parents=True, exist_ok=True)
-    history_path.write_text(json.dumps(history, indent=2), encoding='utf-8')
+    if best_epoch < 0:
+        # Every epoch scored non-finite (or there were none); still persist the
+        # weights so the run is not a total loss.
+        save_checkpoint(model, checkpoint_path, config,
+                        epoch=max(config.TRAIN_EPOCHS - 1, 0))
+        print(f'  no epoch produced a finite score; saved the final weights '
+              f'-> {checkpoint_path}')
 
     print('\n' + '=' * 60)
     print('Training complete')
     print('=' * 60)
-    print(f'Checkpoint: {checkpoint_path}')
+    print(f'Checkpoint: {checkpoint_path} (epoch {max(best_epoch, 0)})')
     print(f'History:    {history_path}')
     print(f'Weights dir: {WEIGHTS_DIR}')
     return 0
+
+
+def write_history(path: Path, history) -> None:
+    """Write the per-epoch metrics atomically so a crash cannot truncate them."""
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(json.dumps(history, indent=2), encoding='utf-8')
+    os.replace(temporary, path)
 
 
 if __name__ == '__main__':

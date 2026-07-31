@@ -61,6 +61,12 @@ def iou_matrix(pred_masks: np.ndarray, gt_masks: np.ndarray) -> np.ndarray:
     if pred_masks.size == 0 or gt_masks.size == 0:
         return np.zeros((len(pred_masks), len(gt_masks)), dtype=np.float64)
 
+    if pred_masks.shape[1:] != gt_masks.shape[1:]:
+        raise ValueError(
+            'Predicted and ground-truth masks must share a spatial shape; got '
+            f'{pred_masks.shape[1:]} vs {gt_masks.shape[1:]}. Predictions are '
+            'reported at the original image size, so the targets must be too.')
+
     preds = _as_bool(pred_masks).reshape(len(pred_masks), -1)
     gts = _as_bool(gt_masks).reshape(len(gt_masks), -1)
 
@@ -148,6 +154,9 @@ class SegmentationEvaluator:
 
     def __init__(self, iou_threshold: float = 0.5):
         self.iou_threshold = float(iou_threshold)
+        if not 0.0 < self.iou_threshold <= 1.0:
+            raise ValueError(
+                f'iou_threshold must be in (0, 1]; got {self.iou_threshold}')
         self.reset()
 
     def reset(self) -> None:
@@ -164,9 +173,16 @@ class SegmentationEvaluator:
         """Add one image worth of predictions and ground truth."""
         pred_masks = np.asarray(pred_masks)
         gt_masks = np.asarray(gt_masks)
-        scores = list(scores)
+        scores = [float(s) for s in scores]
 
-        matches, unmatched_pred, _ = match_instances(
+        if len(scores) != len(pred_masks):
+            raise ValueError(
+                f'Got {len(scores)} score(s) for {len(pred_masks)} predicted '
+                'mask(s); they must line up one-to-one.')
+        if any(not np.isfinite(s) for s in scores):
+            raise ValueError('Detection scores must be finite; got NaN or inf.')
+
+        matches, _, _ = match_instances(
             pred_masks, gt_masks, scores, self.iou_threshold)
 
         matched_preds = {pred_index for pred_index, _, _ in matches}
@@ -182,7 +198,6 @@ class SegmentationEvaluator:
         self.num_ground_truth += len(gt_masks)
         self.num_predictions += len(pred_masks)
         self.num_images += 1
-        del unmatched_pred  # counted implicitly as false positives
 
     def compute(self) -> Dict[str, float]:
         """Precision / recall / F1 / mean IoU / mean Dice / AP for the dataset."""

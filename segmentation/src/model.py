@@ -9,6 +9,8 @@ evaluation loops.
 from __future__ import annotations
 
 import math
+import os
+import random
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -33,7 +35,45 @@ def resolve_device(device: str = 'auto') -> torch.device:
     """Turn ``'auto' | 'cpu' | 'cuda'`` into a concrete :class:`torch.device`."""
     if device == 'auto':
         return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError(
+            'CUDA was requested but torch.cuda.is_available() is False. Install '
+            "a CUDA build of PyTorch or pass --device cpu (or 'auto').")
     return torch.device(device)
+
+
+def set_seed(seed: int, deterministic: bool = False) -> torch.Generator:
+    """Seed every RNG that can influence a run and return a torch generator.
+
+    ``torch.manual_seed`` alone leaves ``random`` and ``numpy`` unseeded, and
+    on GPU leaves cuDNN free to pick non-deterministic kernels, so two runs
+    with the same ``SEED`` were not actually reproducible. The returned
+    generator should be handed to the training ``DataLoader`` so that shuffling
+    is independent of any other draw from the global RNG.
+    """
+    seed = int(seed)
+    if not 0 <= seed < 2 ** 32:
+        raise ValueError(f'seed must fit in 32 bits; got {seed}')
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
+
+
+def seed_worker(worker_id: int) -> None:
+    """DataLoader ``worker_init_fn`` that makes worker RNGs reproducible."""
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def _detection_weights(config: FireDetectionConfig):
@@ -216,16 +256,28 @@ def compute_validation_loss(model: nn.Module, data_loader, device) -> float:
 def evaluate(model: nn.Module, data_loader, device,
              config: FireDetectionConfig) -> Dict[str, float]:
     """Score the model on a labelled split using mask IoU matching."""
+    was_training = model.training
     model.eval()
     evaluator = SegmentationEvaluator(iou_threshold=config.EVAL_IOU_THRESHOLD)
 
-    for images, targets in data_loader:
-        outputs = model([image.to(device) for image in images])
-        for output, target in zip(outputs, targets):
-            pred_masks = masks_to_numpy(output['masks'], config.MASK_BINARY_THRESHOLD)
-            scores = output['scores'].detach().cpu().numpy().tolist()
-            gt_masks = target['masks'].detach().cpu().numpy().astype(bool)
-            evaluator.add(pred_masks, scores, gt_masks)
+    try:
+        for images, targets in data_loader:
+            outputs = model([image.to(device) for image in images])
+            for output, target in zip(outputs, targets):
+                pred_masks = masks_to_numpy(output['masks'],
+                                            config.MASK_BINARY_THRESHOLD)
+                scores = output['scores'].detach().cpu().numpy().tolist()
+                gt_masks = target['masks'].detach().cpu().numpy().astype(bool)
+                if len(gt_masks) and pred_masks.shape[1:] != gt_masks.shape[1:]:
+                    # Should never happen: torchvision pastes masks back to the
+                    # original image size. Fail loudly rather than score noise.
+                    raise RuntimeError(
+                        'Predicted masks are '
+                        f'{pred_masks.shape[1:]} but targets are '
+                        f'{gt_masks.shape[1:]}; evaluation would be meaningless.')
+                evaluator.add(pred_masks, scores, gt_masks)
+    finally:
+        model.train(was_training)
 
     return evaluator.compute()
 
@@ -258,15 +310,48 @@ def save_checkpoint(model: nn.Module, path, config: FireDetectionConfig,
     return destination
 
 
+CHECKPOINT_TRUST_ENV = 'FIRE_TRUST_CHECKPOINT'
+
+
 def load_checkpoint(path, map_location='cpu') -> Dict[str, Any]:
-    """Load a checkpoint dict, tolerating older PyTorch pickling defaults."""
+    """Load a checkpoint dict written by :func:`save_checkpoint`.
+
+    Loading is attempted with ``weights_only=True``, which refuses to execute
+    arbitrary pickle opcodes. A checkpoint that needs the unrestricted loader
+    can execute any code in the process that reads it, so that path is only
+    taken when ``FIRE_TRUST_CHECKPOINT`` is set; otherwise the failure is
+    reported with instructions rather than silently downgraded.
+    """
     checkpoint_path = Path(path)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f'Model checkpoint not found: {checkpoint_path}')
+    if checkpoint_path.is_dir():
+        raise IsADirectoryError(
+            f'Expected a checkpoint file but {checkpoint_path} is a directory')
+    if checkpoint_path.stat().st_size == 0:
+        raise ValueError(f'Checkpoint file is empty: {checkpoint_path}')
+
     try:
-        return torch.load(checkpoint_path, map_location=map_location, weights_only=True)
-    except Exception:
-        return torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location=map_location,
+                                weights_only=True)
+    except Exception as safe_error:
+        if os.environ.get(CHECKPOINT_TRUST_ENV, '').strip().lower() not in {
+                '1', 'true', 'yes', 'on'}:
+            raise ValueError(
+                f'Could not safely load {checkpoint_path}: {safe_error}\n'
+                'It was not written by save_checkpoint(), or it stores objects '
+                'that torch.load(weights_only=True) refuses to unpickle. '
+                'Unpickling arbitrary checkpoints executes code, so set '
+                f'{CHECKPOINT_TRUST_ENV}=1 only if you trust the file.'
+            ) from safe_error
+        checkpoint = torch.load(checkpoint_path, map_location=map_location,
+                                weights_only=False)
+
+    if not isinstance(checkpoint, dict):
+        raise ValueError(
+            f'{checkpoint_path} does not contain a checkpoint dictionary '
+            f'(found {type(checkpoint).__name__}).')
+    return checkpoint
 
 
 def load_model(path, device='auto',
@@ -276,6 +361,17 @@ def load_model(path, device='auto',
     torch_device = resolve_device(device)
     checkpoint = load_checkpoint(path, map_location=torch_device)
 
+    if 'model_state_dict' not in checkpoint:
+        # A bare `torch.save(model.state_dict(), ...)` is the usual mistake.
+        looks_like_state_dict = all(isinstance(v, torch.Tensor)
+                                    for v in checkpoint.values()) and checkpoint
+        hint = (' It looks like a raw state_dict; wrap it with '
+                "{'model_state_dict': ..., 'config': ...} or re-save it with "
+                'save_checkpoint().' if looks_like_state_dict else '')
+        raise KeyError(
+            f'{path} has no "model_state_dict" key (found: '
+            f'{sorted(checkpoint)[:8]}).{hint}')
+
     config_data = dict(checkpoint.get('config') or {})
     config_data.update(config_overrides or {})
     # Never re-download pre-trained weights when the checkpoint already has them.
@@ -283,7 +379,14 @@ def load_model(path, device='auto',
     config = FireDetectionConfig.from_dict(config_data)
 
     model = build_model(config)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f'The weights in {path} do not fit a Mask R-CNN built from its own '
+            f'stored config (NUM_CLASSES={config.NUM_CLASSES}, '
+            f'BACKBONE={config.BACKBONE}). The checkpoint is corrupt or was '
+            f'produced by a different architecture.\n  {exc}') from exc
     model.to(torch_device)
     model.eval()
     return model, config

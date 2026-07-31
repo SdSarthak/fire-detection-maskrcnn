@@ -14,8 +14,9 @@ from conftest import make_fire_image
 from src.config import FireDetectionConfig
 from src.dataset import FireSegmentationDataset, collate_fn
 from src.model import (build_model, compute_validation_loss, create_optimizer,
-                       create_scheduler, evaluate, load_model, masks_to_numpy,
-                       resolve_device, save_checkpoint, train_one_epoch)
+                       create_scheduler, evaluate, load_checkpoint, load_model,
+                       masks_to_numpy, resolve_device, save_checkpoint,
+                       set_seed, train_one_epoch)
 from src.predictor import FirePredictor, mask_to_polygons
 
 
@@ -237,3 +238,120 @@ def test_mask_to_polygons_traces_a_rectangle():
 
 def test_mask_to_polygons_on_empty_mask():
     assert mask_to_polygons(np.zeros((10, 10), dtype=bool)) == []
+
+
+# --------------------------------------------------------------------------- #
+# Checkpoint loading failure modes (Pass 2)
+# --------------------------------------------------------------------------- #
+def test_missing_checkpoint_raises_file_not_found(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_checkpoint(tmp_path / 'absent.pt')
+
+
+def test_empty_checkpoint_file_is_reported_as_empty(tmp_path):
+    path = tmp_path / 'empty.pt'
+    path.write_bytes(b'')
+    with pytest.raises(ValueError, match='empty'):
+        load_checkpoint(path)
+
+
+def test_directory_instead_of_checkpoint_is_reported(tmp_path):
+    directory = tmp_path / 'weights.pt'
+    directory.mkdir()
+    with pytest.raises(IsADirectoryError):
+        load_checkpoint(directory)
+
+
+def test_unsafe_checkpoint_is_refused_unless_explicitly_trusted(tmp_path, monkeypatch):
+    """weights_only=True must not be silently downgraded to arbitrary unpickling."""
+    path = tmp_path / 'pickled.pt'
+    torch.save({'model_state_dict': {'w': torch.zeros(2)},
+                'config': FireDetectionConfig(PRETRAINED_WEIGHTS='none')}, path)
+
+    monkeypatch.delenv('FIRE_TRUST_CHECKPOINT', raising=False)
+    with pytest.raises(ValueError, match='FIRE_TRUST_CHECKPOINT'):
+        load_checkpoint(path)
+
+    monkeypatch.setenv('FIRE_TRUST_CHECKPOINT', '1')
+    assert 'model_state_dict' in load_checkpoint(path)
+
+
+def test_corrupt_checkpoint_bytes_give_an_actionable_error(tmp_path):
+    path = tmp_path / 'corrupt.pt'
+    path.write_bytes(b'not a torch archive at all')
+    with pytest.raises(ValueError, match='Could not safely load'):
+        load_checkpoint(path)
+
+
+def test_raw_state_dict_is_diagnosed_rather_than_key_erroring(tmp_path, tiny_config):
+    """`torch.save(model.state_dict(), ...)` is the classic user mistake."""
+    path = tmp_path / 'raw.pt'
+    torch.save({'backbone.body.conv1.weight': torch.zeros(2, 2)}, path)
+
+    with pytest.raises(KeyError, match='raw state_dict'):
+        load_model(path, device='cpu')
+
+
+def test_checkpoint_whose_weights_do_not_fit_its_config_is_reported(tmp_path, tiny_config):
+    path = tmp_path / 'mismatch.pt'
+    torch.save({'model_state_dict': {'nonsense.weight': torch.zeros(3)},
+                'config': tiny_config.to_dict()}, path)
+
+    with pytest.raises(RuntimeError, match='do not fit'):
+        load_model(path, device='cpu')
+
+
+# --------------------------------------------------------------------------- #
+# Seeding (Pass 2)
+# --------------------------------------------------------------------------- #
+def test_set_seed_fixes_torch_numpy_and_random():
+    import random as _random
+
+    set_seed(1234)
+    first = (torch.rand(3).tolist(), np.random.rand(3).tolist(),
+             [_random.random() for _ in range(3)])
+
+    set_seed(1234)
+    second = (torch.rand(3).tolist(), np.random.rand(3).tolist(),
+              [_random.random() for _ in range(3)])
+
+    assert first == second
+
+
+def test_set_seed_returns_an_independent_generator():
+    generator = set_seed(7)
+    drawn = torch.rand(4, generator=generator).tolist()
+
+    generator = set_seed(7)
+    assert torch.rand(4, generator=generator).tolist() == drawn
+
+
+def test_set_seed_rejects_seeds_outside_32_bits():
+    with pytest.raises(ValueError, match='32 bits'):
+        set_seed(2 ** 40)
+
+
+def test_seeded_flip_augmentation_is_reproducible(dataset_dir):
+    def first_mask():
+        set_seed(99)
+        dataset = FireSegmentationDataset(
+            images_dir=dataset_dir / 'train',
+            annotations=dataset_dir / 'annotations' / 'train_annotations.json',
+            horizontal_flip_prob=0.5)
+        return np.stack([dataset[i][1]['masks'].numpy().sum(axis=(1, 2))
+                         for i in range(len(dataset))])
+
+    np.testing.assert_array_equal(first_mask(), first_mask())
+
+
+def test_evaluate_restores_the_previous_module_mode(tiny_config, tiny_model,
+                                                    dataset_dir):
+    loader = loader_for(dataset_dir / 'val',
+                        dataset_dir / 'annotations' / 'val_annotations.json',
+                        tiny_config)
+    tiny_model.train()
+    try:
+        evaluate(tiny_model, loader, torch.device('cpu'), tiny_config)
+        assert tiny_model.training is True
+    finally:
+        tiny_model.eval()

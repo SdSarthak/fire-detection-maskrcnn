@@ -149,3 +149,71 @@ def test_evaluator_with_no_data_is_all_zeros():
     assert result['precision'] == 0.0
     assert result['recall'] == 0.0
     assert result['f1'] == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Evaluator input validation (Pass 2)
+# --------------------------------------------------------------------------- #
+def test_mismatched_mask_shapes_raise_an_explanatory_error():
+    predictions = np.zeros((1, 8, 8), dtype=bool)
+    ground_truth = np.zeros((1, 16, 16), dtype=bool)
+    predictions[0, 2:6, 2:6] = True
+    ground_truth[0, 4:12, 4:12] = True
+
+    with pytest.raises(ValueError, match='spatial shape'):
+        iou_matrix(predictions, ground_truth)
+
+    with pytest.raises(ValueError, match='spatial shape'):
+        SegmentationEvaluator().add(predictions, [0.9], ground_truth)
+
+
+def test_score_count_must_match_prediction_count():
+    predictions = np.zeros((2, 8, 8), dtype=bool)
+    predictions[:, 1:4, 1:4] = True
+
+    with pytest.raises(ValueError, match='one-to-one'):
+        SegmentationEvaluator().add(predictions, [0.9], np.zeros((0, 8, 8), bool))
+
+
+def test_non_finite_scores_are_rejected():
+    predictions = np.zeros((1, 8, 8), dtype=bool)
+    predictions[0, 1:4, 1:4] = True
+
+    with pytest.raises(ValueError, match='finite'):
+        SegmentationEvaluator().add(predictions, [float('nan')],
+                                    np.zeros((0, 8, 8), bool))
+
+
+@pytest.mark.parametrize('threshold', [0.0, -0.5, 1.5])
+def test_evaluator_rejects_out_of_range_iou_threshold(threshold):
+    with pytest.raises(ValueError, match='iou_threshold'):
+        SegmentationEvaluator(iou_threshold=threshold)
+
+
+def test_evaluator_handles_an_image_with_no_predictions_and_no_ground_truth():
+    evaluator = SegmentationEvaluator()
+    empty = np.zeros((0, 8, 8), dtype=bool)
+
+    evaluator.add(empty, [], empty)
+    summary = evaluator.compute()
+
+    assert summary['images'] == 1.0
+    assert summary['precision'] == 0.0 and summary['recall'] == 0.0
+    assert summary['f1'] == 0.0
+    assert summary['ap@0.5'] == 0.0
+
+
+def test_all_predictions_missed_gives_zero_precision_and_recall():
+    predictions = np.zeros((1, 10, 10), dtype=bool)
+    predictions[0, 0:2, 0:2] = True
+    ground_truth = np.zeros((1, 10, 10), dtype=bool)
+    ground_truth[0, 7:10, 7:10] = True
+
+    evaluator = SegmentationEvaluator()
+    evaluator.add(predictions, [0.99], ground_truth)
+    summary = evaluator.compute()
+
+    assert summary['true_positives'] == 0.0
+    assert summary['false_positives'] == 1.0
+    assert summary['false_negatives'] == 1.0
+    assert summary['mean_iou'] == 0.0
