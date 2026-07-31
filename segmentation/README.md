@@ -144,6 +144,24 @@ A diverging loss aborts with the offending components and a pointer at
 The first epoch uses a linear learning-rate warm-up, which matters because
 freshly initialised detection heads produce large early gradients.
 
+`outputs/training_history.json` is rewritten atomically after every epoch, so a
+crash at epoch 27 of 30 still leaves the first 27 on disk.
+
+### Reproducibility
+
+`--seed` (default 42) seeds `random`, `numpy` and torch, seeds every CUDA
+device, and drives a dedicated generator for the training `DataLoader` so the
+shuffle order does not depend on anything else drawing from the global RNG.
+DataLoader workers are seeded through `worker_init_fn`. Add `--deterministic`
+to also pin cuDNN to deterministic kernels (slower, GPU only).
+
+### Split hygiene
+
+Training aborts if any image basename appears in both `data/train` and
+`data/val` - otherwise every reported `val_f1` would be a training score.
+Duplicate basenames *within* one split raise a warning, because annotations are
+keyed by basename and the duplicates would share labels.
+
 ## Inference
 
 ```bash

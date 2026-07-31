@@ -73,8 +73,16 @@ there is no temp-file cleanup path to leak.
 | `MASK_THRESHOLD` | `0.5` | Soft-mask binarisation cut-off |
 | `MAX_CONTENT_LENGTH_MB` | `16` | Request body limit (returns 413) |
 | `MAX_BATCH_SIZE` | `16` | Images per `/batch_predict` call |
+| `MAX_IMAGE_PIXELS` | `40000000` | Cap on *decoded* pixels (returns 400) |
+| `MODEL_LOAD_RETRY_SECONDS` | `30` | Back-off before re-attempting a failed load |
 | `MODEL_VERSION` | `unknown` | Reported by `/model_info` |
 | `PORT` | `5000` | Dev server only; uWSGI binds via `uwsgi.ini` |
+
+`MAX_CONTENT_LENGTH_MB` bounds the *compressed* upload. A few-kilobyte PNG can
+still decode to gigabytes, so `MAX_IMAGE_PIXELS` bounds the decoded array
+separately; oversized images are rejected with a 400 before they reach the
+model. Unexpected server-side failures return a generic `Prediction failed`
+message - the traceback goes to the container log, not to the caller.
 
 ### Metrics
 

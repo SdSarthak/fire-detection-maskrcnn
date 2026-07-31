@@ -83,6 +83,7 @@ Useful flags:
 | `--device auto\|cpu\|cuda` | Force a device |
 | `--class-filter fire,flame` | Which region attributes count as fire |
 | `--output` | Checkpoint path |
+| `--seed` / `--deterministic` | Reproducible runs (seeds torch, numpy, random, CUDA) |
 
 Each epoch reports the four Mask R-CNN losses plus validation loss, precision,
 recall, F1, mean IoU and AP@0.5. The checkpoint with the best validation F1 is
@@ -90,7 +91,12 @@ kept, and the full history is written to `outputs/training_history.json`.
 
 A checkpoint stores its own configuration, so inference rebuilds the exact
 architecture it was trained with — there is no way to load weights into a
-mismatched model.
+mismatched model. Checkpoints load with `weights_only=True`; a file that needs
+the unrestricted pickle loader is refused unless `FIRE_TRUST_CHECKPOINT=1` is
+set, because unpickling an untrusted checkpoint executes arbitrary code.
+
+Training refuses to start if the same image basename appears in both the train
+and val splits.
 
 ## 3. Run inference
 
